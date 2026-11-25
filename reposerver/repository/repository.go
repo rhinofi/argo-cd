@@ -3819,13 +3819,7 @@ func (s *Service) UpdateRevisionForPaths(ctx context.Context, request *apiclient
 			}
 			return nil, err
 		}
-		if errors.Is(err, git.ErrRevisionNotFound) {
-			// A base gone from the remote (e.g. force-pushed away) can only be replaced by a sync; report
-			// changes so one can happen.
-			logCtx.Warnf("last synced revision %s is gone from the remote, reporting changes: %v", syncBaseRevision, err)
-			syncEval = cacheEval
-			forceChanges = true
-		} else {
+		if !errors.Is(err, git.ErrRevisionNotFound) {
 			// Still perform best-effort cache transfer using the compared base, but never substitute
 			// cacheEval's clean verdict for the sync decision: a failed diff against the last synced
 			// base must fail the RPC so the controller retries rather than skipping hooks or wedging.
@@ -3836,6 +3830,11 @@ func (s *Service) UpdateRevisionForPaths(ctx context.Context, request *apiclient
 			}
 			return nil, err
 		}
+		// A base gone from the remote (e.g. force-pushed away) can only be replaced by a sync; report
+		// changes so one can happen.
+		logCtx.Warnf("last synced revision %s is gone from the remote, reporting changes: %v", syncBaseRevision, err)
+		syncEval = cacheEval
+		forceChanges = true
 	}
 
 	// The refs were diffed, but a non-git main source's version never is (see above).

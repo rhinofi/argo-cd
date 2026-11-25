@@ -782,11 +782,12 @@ func (m *appStateManager) CompareAppState(ctx context.Context, app *v1alpha1.App
 		}
 		syncStatus.Revisions = slices.Clone(app.Status.Sync.Revisions)
 	} else {
-		if !app.Status.Sync.ComparedTo.Source.Equals(&v1alpha1.ApplicationSource{}) {
+		switch {
+		case !app.Status.Sync.ComparedTo.Source.Equals(&v1alpha1.ApplicationSource{}):
 			syncStatus.ComparedTo.Source = *app.Status.Sync.ComparedTo.Source.DeepCopy()
-		} else if len(sources) > 0 {
+		case len(sources) > 0:
 			syncStatus.ComparedTo.Source = sources[0]
-		} else {
+		default:
 			logCtx.Warn("CompareAppState: sources should not be empty")
 		}
 		syncStatus.Revision = app.Status.Sync.Revision

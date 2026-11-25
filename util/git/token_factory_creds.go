@@ -126,8 +126,6 @@ func newTokenFactoryCreds(
 	iamCredentialsBaseURL string,
 	gcpAccessToken gcpAccessTokenFunc,
 	cache *tokenFactoryTokenCache,
-	refreshMargin time.Duration,
-	failureBackoff time.Duration,
 	now func() time.Time,
 ) TokenFactoryCreds {
 	if httpClient == nil {
@@ -142,12 +140,6 @@ func newTokenFactoryCreds(
 	if cache == nil {
 		cache = defaultTokenFactoryCache
 	}
-	if refreshMargin <= 0 {
-		refreshMargin = tokenFactoryRefreshMargin
-	}
-	if failureBackoff <= 0 {
-		failureBackoff = tokenFactoryFailureBackoff
-	}
 	if now == nil {
 		now = time.Now
 	}
@@ -159,8 +151,8 @@ func newTokenFactoryCreds(
 		iamCredentialsBaseURL: strings.TrimRight(iamCredentialsBaseURL, "/"),
 		gcpAccessToken:        gcpAccessToken,
 		cache:                 cache,
-		refreshMargin:         refreshMargin,
-		failureBackoff:        failureBackoff,
+		refreshMargin:         tokenFactoryRefreshMargin,
+		failureBackoff:        tokenFactoryFailureBackoff,
 		now:                   now,
 	}
 }
@@ -191,8 +183,6 @@ func NewTokenFactoryCredsForRepo(repoURL string, store CredsStore) (TokenFactory
 		defaultIAMCredentialsBaseURL,
 		getDefaultGCPAccessToken,
 		defaultTokenFactoryCache,
-		tokenFactoryRefreshMargin,
-		tokenFactoryFailureBackoff,
 		time.Now,
 	), true
 }

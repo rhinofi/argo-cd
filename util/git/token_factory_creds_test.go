@@ -146,8 +146,6 @@ func TestTokenFactoryCredsMintCacheRefreshAndFallback(t *testing.T) {
 		iamServer.URL,
 		func(_ context.Context) (string, error) { return "gcp-access-token", nil },
 		newTokenFactoryTokenCache(),
-		5*time.Minute,
-		15*time.Second,
 		now,
 	)
 
@@ -230,8 +228,6 @@ func TestTokenFactoryCredsConcurrentDeduplication(t *testing.T) {
 		iamServer.URL,
 		func(_ context.Context) (string, error) { return "gcp-access-token", nil },
 		newTokenFactoryTokenCache(),
-		5*time.Minute,
-		15*time.Second,
 		time.Now,
 	)
 
@@ -301,8 +297,6 @@ func TestTokenFactoryCredsConcurrentFailureSharesResultAndBacksOff(t *testing.T)
 		iamServer.URL,
 		func(_ context.Context) (string, error) { return "gcp-access-token", nil },
 		newTokenFactoryTokenCache(),
-		5*time.Minute,
-		15*time.Second,
 		now,
 	)
 
@@ -396,8 +390,6 @@ func TestTokenFactoryCredsFallbackRechecksExpiryAfterFailedRefresh(t *testing.T)
 		iamServer.URL,
 		func(_ context.Context) (string, error) { return "gcp-access-token", nil },
 		newTokenFactoryTokenCache(),
-		5*time.Minute,
-		15*time.Second,
 		now,
 	)
 

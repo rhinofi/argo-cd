@@ -6654,7 +6654,8 @@ func TestUpdateRevisionForPaths_ShallowRepoWithPrunedSyncBase(t *testing.T) {
 	runGit(t, dir, "reflog", "expire", "--expire=now", "--all")
 	runGit(t, dir, "gc", "--prune=now")
 	checkObject := exec.CommandContext(t.Context(), "git", "-C", dir, "cat-file", "-e", lastSync)
-	require.IsType(t, &exec.ExitError{}, checkObject.Run())
+	var exitErr *exec.ExitError
+	require.ErrorAs(t, checkObject.Run(), &exitErr)
 	require.NoError(t, os.Mkdir(filepath.Join(dir, "app"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "app", "deploy.yaml"), []byte("kind: Deployment\n"), 0o644))
 	runGit(t, dir, "add", "app/deploy.yaml")
