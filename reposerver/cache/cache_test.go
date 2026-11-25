@@ -885,6 +885,22 @@ func TestGetGitFilesChanges(t *testing.T) {
 		assert.Equal(t, expectedItem, files)
 		fixtures.mockCache.AssertCacheCalledTimes(t, &mocks.CacheCallCounts{ExternalGets: 1, ExternalSets: 1})
 	})
+
+	t.Run("GetGitFilesChanges ignores unversioned legacy key", func(t *testing.T) {
+		t.Parallel()
+		fixtures := newFixtures()
+		t.Cleanup(fixtures.mockCache.StopRedisCallback)
+		legacyKey := "gitFilesChanges|test-repo|test-revision|syncedRevision"
+		require.NotEqual(t, legacyKey, getGitFilesChangesKey("test-repo", "test-revision", "syncedRevision"))
+		err := fixtures.cache.cache.SetItem(
+			legacyKey,
+			[]string{"sibling/deploy.yaml"},
+			&cacheutil.CacheActionOpts{Expiration: 30 * time.Second})
+		require.NoError(t, err)
+		files, err := fixtures.cache.GetGitFilesChanges("test-repo", "test-revision", "syncedRevision")
+		require.ErrorIs(t, err, ErrCacheMiss)
+		assert.Empty(t, files)
+	})
 }
 
 func TestGetOciDirectories(t *testing.T) {

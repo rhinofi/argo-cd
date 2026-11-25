@@ -6035,12 +6035,42 @@ func TestUpdateRevisionForPaths_LastSyncedBase(t *testing.T) {
 		assert.Equal(t, revResolved, resp.Revision)
 		assert.False(t, manifestCacheContains(cacheMocks, request, revResolved), "cache transfer is skipped when the compared base cannot be evaluated")
 	})
-	t.Run("shallow fetch of last-synced base refused: fails RPC instead of falling back to clean compared base", func(t *testing.T) {
-		// If a shallow clone can no longer fetch the last-synced commit A, falling back to cacheEval (B..B clean)
-		// would cause selfHeal=true to selectively sync B and skip hooks (or selfHeal=false to stay OutOfSync forever).
+	t.Run("shallow fetch of last-synced base permanently refused: reports changes so full sync replaces unrecoverable base", func(t *testing.T) {
+		// When a shallow clone can never fetch the historical last-synced SHA ("not our ref"), retrying
+		// forever would block auto-sync indefinitely. Treat permanent refusal like a missing remote ref
+		// so a full sync replaces the unrecoverable base while still transferring cache from the compared base.
 		s, _, cacheMocks := newServiceWithOpt(t, func(gitClient *gitmocks.Client, _ *helmmocks.Client, _ *ocimocks.Client, paths *iomocks.TempPaths) {
 			gitClient.EXPECT().Init().Return(nil)
 			gitClient.EXPECT().Fetch(mock.Anything, revLastSynced, int64(1)).Return(errors.New("fatal: remote error: upload-pack: not our ref " + revLastSynced))
+			gitClient.EXPECT().Fetch(mock.Anything, mock.Anything, mock.Anything).Return(nil)
+			gitClient.EXPECT().IsRevisionPresent(mock.Anything, mock.Anything).Return(false)
+			gitClient.EXPECT().Checkout(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return("", nil)
+			gitClient.EXPECT().LsRemote("HEAD").Return(revResolved, nil)
+			gitClient.EXPECT().LsRemote(revResolved).Return(revResolved, nil).Maybe()
+			gitClient.EXPECT().LsRemote(revLastSynced).Return(revLastSynced, nil)
+			gitClient.EXPECT().LsRemote(revCompared).Return(revCompared, nil)
+			gitClient.EXPECT().Root().Return("")
+			gitClient.EXPECT().ChangedFiles(mock.Anything, revCompared, revResolved).Return(nil, nil)
+			paths.EXPECT().GetPath(mock.Anything).Return(".", nil)
+			paths.EXPECT().GetPathIfExists(mock.Anything).Return(".")
+		}, ".")
+		request := newRequest(revCompared)
+		request.Repo.Depth = 1
+		seedManifestCache(t, cacheMocks, request, revCompared)
+
+		resp, err := s.UpdateRevisionForPaths(t.Context(), request)
+		require.NoError(t, err)
+		assert.True(t, resp.Changes, "permanently unfetchable shallow base must report changes so full sync can replace it")
+		assert.Equal(t, revResolved, resp.Revision)
+		assert.True(t, manifestCacheContains(cacheMocks, request, revResolved), "cache transfer still runs on the compared base")
+	})
+
+	t.Run("shallow fetch of last-synced base transient error: fails RPC so controller retries while still transferring cache", func(t *testing.T) {
+		// Unlike permanent "not our ref", a transient shallow fetch failure must return an error so the
+		// controller retries instead of triggering a spurious full sync or skipping hooks.
+		s, _, cacheMocks := newServiceWithOpt(t, func(gitClient *gitmocks.Client, _ *helmmocks.Client, _ *ocimocks.Client, paths *iomocks.TempPaths) {
+			gitClient.EXPECT().Init().Return(nil)
+			gitClient.EXPECT().Fetch(mock.Anything, revLastSynced, int64(1)).Return(errors.New("connection reset by peer"))
 			gitClient.EXPECT().Fetch(mock.Anything, mock.Anything, mock.Anything).Return(nil)
 			gitClient.EXPECT().IsRevisionPresent(mock.Anything, mock.Anything).Return(false)
 			gitClient.EXPECT().Checkout(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return("", nil)
@@ -6205,6 +6235,63 @@ func TestUpdateRevisionForPaths_NonGitSourceUsesLastSyncedVersion(t *testing.T) 
 		assert.Equal(t, "1.3.0", resp.Revision)
 	})
 
+	t.Run("new Helm chart version with unrelated ref commit skips manifest cache transfer", func(t *testing.T) {
+		// Regression: when the Helm chart advances (1.0.0 -> 1.1.0) while its $values ref advances
+		// through an unrelated commit, UpdateRevisionForPaths must NOT copy the 1.0.0 manifests
+		// into the 1.1.0 cache key.
+		shaOld := "1e67a504d03def3a6a1125d934cb511680f72555"
+		shaNew := "2f78b615e14efa4b7b2236e045dc622791a83666"
+		s, _, cacheMocks := newServiceWithOpt(t, func(gitClient *gitmocks.Client, _ *helmmocks.Client, _ *ocimocks.Client, paths *iomocks.TempPaths) {
+			gitClient.EXPECT().Init().Return(nil)
+			gitClient.EXPECT().Fetch(mock.Anything, mock.Anything, mock.Anything).Return(nil)
+			gitClient.EXPECT().IsRevisionPresent(mock.Anything, mock.Anything).Return(false)
+			gitClient.EXPECT().Checkout(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return("", nil)
+			gitClient.EXPECT().LsRemote("HEAD").Return(shaNew, nil)
+			gitClient.EXPECT().LsRemote(shaOld).Return(shaOld, nil)
+			gitClient.EXPECT().Root().Return("")
+			gitClient.EXPECT().ChangedFiles(mock.Anything, shaOld, shaNew).Return([]string{"unrelated/file.yaml"}, nil)
+			paths.EXPECT().GetPath(mock.Anything).Return(".", nil)
+			paths.EXPECT().GetPathIfExists(mock.Anything).Return(".")
+		}, ".")
+		refRepo := v1alpha1.Repository{Repo: "a-url.com"}
+		request := newRequest("1.0.0", "1.1.0")
+		request.SyncedRevision = "1.0.0"
+		request.Paths = []string{"values"}
+		request.HasMultipleSources = true
+		request.ApplicationSource.Helm = &v1alpha1.ApplicationSourceHelm{ValueFiles: []string{"$values/values/app.yaml"}}
+		request.RefSources = v1alpha1.RefTargetRevisionMapping{
+			"$values": {Repo: refRepo, TargetRevision: "HEAD"},
+		}
+		request.SyncedRefSources = v1alpha1.RefTargetRevisionMapping{
+			"$values": {Repo: refRepo, TargetRevision: shaOld},
+		}
+		request.LastSyncedRefSources = v1alpha1.RefTargetRevisionMapping{
+			"$values": {Repo: refRepo, TargetRevision: shaOld},
+		}
+
+		oldKey := cache.NewManifestKey("1.0.0", request.ApplicationSource, request.GetRefSources(), request.GetNamespace(),
+			request.GetTrackingMethod(), request.GetAppLabelKey(), request.GetAppName(), request.GetInstallationID(),
+			request.GetSourceIntegrity(), request, map[string]string{git.NormalizeGitURL(refRepo.Repo): shaOld})
+		newKey := cache.NewManifestKey("1.1.0", request.ApplicationSource, request.GetRefSources(), request.GetNamespace(),
+			request.GetTrackingMethod(), request.GetAppLabelKey(), request.GetAppName(), request.GetInstallationID(),
+			request.GetSourceIntegrity(), request, map[string]string{git.NormalizeGitURL(refRepo.Repo): shaNew})
+		require.NoError(t, cacheMocks.cache.SetManifests(oldKey, &cache.CachedManifestResponse{
+			ManifestResponse: &apiclient.ManifestResponse{
+				Revision:  "1.0.0",
+				Manifests: []string{`{"kind":"ConfigMap","metadata":{"name":"old-1.0.0"}}`},
+			},
+		}))
+
+		resp, err := s.UpdateRevisionForPaths(t.Context(), request)
+		require.NoError(t, err)
+		assert.True(t, resp.Changes)
+		assert.Equal(t, "1.1.0", resp.Revision)
+
+		var cached cache.CachedManifestResponse
+		err = cacheMocks.cache.GetManifests(newKey, &cached)
+		require.ErrorIs(t, err, cache.ErrCacheMiss, "old 1.0.0 manifests must not be copied into the 1.1.0 cache key")
+	})
+
 	t.Run("version constraint is resolved before comparing and returned on both changed and unchanged results", func(t *testing.T) {
 		// Revision carries the unresolved targetRevision. Returning the concrete resolved version on
 		// both changed and unchanged verdicts ensures GenerateManifest renders the exact release checked.
@@ -6214,26 +6301,28 @@ func TestUpdateRevisionForPaths_NonGitSourceUsesLastSyncedVersion(t *testing.T) 
 		}
 		for _, tc := range []struct {
 			name         string
+			selector     string
 			latest       string
 			withRefs     bool
 			changes      bool
 			wantRevision string
+			wantErr      bool
 		}{
-			{"unchanged without refs", "1.2.3", false, false, "1.2.3"},
-			{"unchanged with unchanged refs", "1.2.3", true, false, "1.2.3"},
-			{"new release without refs", "1.3.0", false, true, "1.3.0"},
-			{"new release with unchanged refs", "1.3.0", true, true, "1.3.0"},
-			{"resolve error falls back to compared version", "", false, false, "1.2.3"},
+			{"unchanged without refs", "1.*", "1.2.3", false, false, "1.2.3", false},
+			{"unchanged with unchanged refs", "1.*", "1.2.3", true, false, "1.2.3", false},
+			{"new release without refs", "1.*", "1.3.0", false, true, "1.3.0", false},
+			{"new release with unchanged refs", "1.*", "1.3.0", true, true, "1.3.0", false},
+			{"resolve error returns error instead of falling back to previously compared version", "2.*", "", false, false, "", true},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				s, _, _ := newServiceWithOpt(t, func(_ *gitmocks.Client, helmClient *helmmocks.Client, _ *ocimocks.Client, _ *iomocks.TempPaths) {
-					if tc.latest == "" {
+					if tc.wantErr {
 						helmClient.EXPECT().GetTags(mock.Anything, "test", false).Return(nil, errors.New("registry unavailable"))
 						return
 					}
 					helmClient.EXPECT().GetTags(mock.Anything, "test", false).Return([]string{"1.2.3", tc.latest}, nil)
 				}, ".")
-				request := newRequest("1.2.3", "1.*")
+				request := newRequest("1.2.3", tc.selector)
 				request.SyncedRevision = "1.2.3"
 				if tc.withRefs {
 					request.HasMultipleSources = true
@@ -6243,6 +6332,12 @@ func TestUpdateRevisionForPaths_NonGitSourceUsesLastSyncedVersion(t *testing.T) 
 					request.LastSyncedRefSources = refs
 				}
 				resp, err := s.UpdateRevisionForPaths(t.Context(), request)
+				if tc.wantErr {
+					require.Error(t, err)
+					assert.Nil(t, resp)
+					assert.Equal(t, codes.Internal, status.Code(err))
+					return
+				}
 				require.NoError(t, err)
 				assert.Equal(t, tc.changes, resp.Changes)
 				assert.Equal(t, tc.wantRevision, resp.Revision, "must return the concrete resolved version so GenerateManifest does not re-resolve a moving selector")
