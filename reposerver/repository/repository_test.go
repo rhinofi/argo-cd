@@ -1534,6 +1534,10 @@ func TestHelmManifestFromChartRepoWithValueFileLinks(t *testing.T) {
 }
 
 func TestGenerateHelmWithURL(t *testing.T) {
+	base, ca := fileutil.ServeFixture(t, "guestbook", "https://raw.githubusercontent.com/argoproj/argocd-example-apps/"+fileutil.ExampleAppsRevision+"/helm-guestbook")
+	if ca != "" {
+		t.Setenv("SSL_CERT_FILE", ca)
+	}
 	service := newService(t, "../../util/helm/testdata/redis")
 
 	_, err := service.GenerateManifest(t.Context(), &apiclient.ManifestRequest{
@@ -1542,7 +1546,7 @@ func TestGenerateHelmWithURL(t *testing.T) {
 		ApplicationSource: &v1alpha1.ApplicationSource{
 			Path: ".",
 			Helm: &v1alpha1.ApplicationSourceHelm{
-				ValueFiles:   []string{"https://raw.githubusercontent.com/argoproj/argocd-example-apps/master/helm-guestbook/values.yaml"},
+				ValueFiles:   []string{base + "/values.yaml"},
 				ValuesObject: &runtime.RawExtension{Raw: []byte(`cluster: {slaveCount: 2}`)},
 			},
 		},

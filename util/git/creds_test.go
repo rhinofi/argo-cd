@@ -1121,15 +1121,28 @@ func TestGitHubAppGetAccessToken_DialerDefaultTimeout(t *testing.T) {
 		})
 		// Set a timeout value higher than the default dial context timeout 30s
 		gitClientTimeout = 35 * time.Second
-		// Use the transport directly (as ghinstallation does internally)
-		// without any context deadline, isolating the dialer's 30s timeout.
-		const unreachableAddr = "192.0.2.1:12345"
+		// Hold DNS resolution open so the real dialer reaches its deadline on
+		// every network, even when the kernel rejects unroutable IPs immediately.
+		release := make(chan struct{})
+		previousResolver := net.DefaultResolver
+		net.DefaultResolver = &net.Resolver{PreferGo: true, Dial: func(context.Context, string, string) (net.Conn, error) {
+			<-release
+			return nil, net.ErrClosed
+		}}
+		t.Cleanup(func() {
+			close(release)
+			net.DefaultResolver = previousResolver
+		})
 
-		creds := newTestGitHubAppCreds(12345, 67890, fakeGitHubAppPrivateKey, "http://"+unreachableAddr)
+		creds := newTestGitHubAppCreds(12345, 67890, fakeGitHubAppPrivateKey, "http://unreachable.test")
+		start := time.Now()
 		token, err := creds.getAccessToken()
 		require.Empty(t, token)
-		require.Error(t, err)
-		require.Contains(t, err.Error(), fmt.Sprintf("dial tcp %s: i/o timeout", unreachableAddr))
+		var dialErr *net.OpError
+		require.ErrorAs(t, err, &dialErr)
+		require.Equal(t, "dial", dialErr.Op)
+		require.True(t, dialErr.Timeout())
+		require.GreaterOrEqual(t, time.Since(start), 30*time.Second)
 	})
 
 	t.Run("successful connection completes well within dialer 30s timeout", func(t *testing.T) {

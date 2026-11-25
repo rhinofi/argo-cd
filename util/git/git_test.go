@@ -3,7 +3,10 @@ package git
 import (
 	"io"
 	"net/http"
+	"net/http/cgi"
+	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -420,11 +423,45 @@ func TestLFSClient(t *testing.T) {
 	}
 }
 
+// Serve the pinned repository with Git's smart HTTP protocol, including shallow fetches.
+func exampleAppsURL(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if root := os.Getenv("ARGOCD_TEST_FIXTURES"); root != "" {
+		require.NoError(t, runCmd(t.Context(), dir, "git", "clone", "--bare", filepath.Join(root, "examples.bundle"), "examples.git"))
+	} else {
+		require.NoError(t, runCmd(t.Context(), dir, "git", "init", "--bare", "-b", "master", "examples.git"))
+		require.NoError(t, runCmd(t.Context(), filepath.Join(dir, "examples.git"), "git", "fetch", "--no-tags",
+			"https://github.com/argoproj/argocd-example-apps.git", path.ExampleAppsRevision+":refs/heads/master"))
+	}
+	head, err := outputCmd(t.Context(), filepath.Join(dir, "examples.git"), "git", "rev-parse", "HEAD")
+	require.NoError(t, err)
+	require.Equal(t, path.ExampleAppsRevision, strings.TrimSpace(string(head)))
+	git, err := exec.LookPath("git")
+	require.NoError(t, err)
+	server := httptest.NewServer(&cgi.Handler{
+		Path: git, Args: []string{"http-backend"},
+		Env: []string{"GIT_PROJECT_ROOT=" + dir, "GIT_HTTP_EXPORT_ALL=1"},
+	})
+	t.Cleanup(server.Close)
+	return server.URL + "/examples.git"
+}
+
+func taggedRepo(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	require.NoError(t, runCmd(t.Context(), dir, "git", "init", "-b", "master"))
+	require.NoError(t, runCmd(t.Context(), dir, "git", "commit", "--allow-empty", "-m", "initial"))
+	require.NoError(t, runCmd(t.Context(), dir, "git", "tag", "-a", "v1.0.0", "-m", "release"))
+	return "file://" + dir
+}
+
 func TestVerifyCommitSignature(t *testing.T) {
+	t.Setenv(common.EnvGnuPGHome, t.TempDir())
 	setupGitEnv(t)
 	p := t.TempDir()
 
-	client, err := NewClientExt("https://github.com/argoproj/argocd-example-apps.git", p, NopCreds{}, false, false, "", "")
+	client, err := NewClientExt(exampleAppsURL(t), p, NopCreds{}, false, false, "", "")
 	require.NoError(t, err)
 
 	err = client.Init()
@@ -479,7 +516,7 @@ func TestNewFactory(t *testing.T) {
 		name string
 		args args
 	}{
-		{"GitHub", args{url: "https://github.com/argoproj/argocd-example-apps"}},
+		{"HTTP", args{url: exampleAppsURL(t)}},
 	}
 	for _, tt := range tests {
 		if tt.name == "PrivateSSHRepo" {
@@ -525,7 +562,7 @@ func TestListRevisions(t *testing.T) {
 	setupGitEnv(t)
 	dir := t.TempDir()
 
-	repoURL := "https://github.com/argoproj/argo-cd.git"
+	repoURL := taggedRepo(t)
 	client, err := NewClientExt(repoURL, dir, NopCreds{}, false, false, "", "")
 	require.NoError(t, err)
 
@@ -786,7 +823,7 @@ func TestAnnotatedTagHandling(t *testing.T) {
 	setupGitEnv(t)
 	dir := t.TempDir()
 
-	client, err := NewClientExt("https://github.com/argoproj/argo-cd.git", dir, NopCreds{}, false, false, "", "")
+	client, err := NewClientExt(taggedRepo(t), dir, NopCreds{}, false, false, "", "")
 	require.NoError(t, err)
 
 	err = client.Init()

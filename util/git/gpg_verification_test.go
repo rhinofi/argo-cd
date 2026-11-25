@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/argoproj/argo-cd/v3/common"
+	"github.com/argoproj/argo-cd/v3/util/gpgsign/gpgsigntest"
 )
 
 type gpgReadyRepo struct {
@@ -23,7 +24,7 @@ type gpgReadyRepo struct {
 
 func newGPGReadyRepo(t *testing.T) *gpgReadyRepo {
 	t.Helper()
-	repo := &gpgReadyRepo{t, nil, t.TempDir()}
+	repo := &gpgReadyRepo{t, nil, gpgsigntest.ShortTempDir(t)}
 
 	t.Setenv(common.EnvGnuPGHome, repo.gpgHome)
 
@@ -111,7 +112,7 @@ save
 func (g *gpgReadyRepo) cmd(args ...string) error {
 	cmd := exec.CommandContext(g.t.Context(), "git", args...)
 	cmd.Dir = g.git.Root()
-	cmd.Env = append(cmd.Env, "GNUPGHOME="+g.gpgHome)
+	cmd.Env = append(cmd.Environ(), "GNUPGHOME="+g.gpgHome)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()

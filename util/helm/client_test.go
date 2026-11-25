@@ -24,6 +24,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v2"
 
+	"github.com/argoproj/argo-cd/v3/test/fixture/path"
 	utilio "github.com/argoproj/argo-cd/v3/util/io"
 	"github.com/argoproj/argo-cd/v3/util/workloadidentity"
 	"github.com/argoproj/argo-cd/v3/util/workloadidentity/mocks"
@@ -47,24 +48,28 @@ func (f *fakeIndexCache) GetHelmIndex(_ string, indexData *[]byte) error {
 	return nil
 }
 
+const testChartRepo = "https://raw.githubusercontent.com/argoproj/argo-helm/877f58ee43b7f3ce99a7f1cf216bebb1a28e1b54"
+
 func TestIndex(t *testing.T) {
+	repo, ca := path.ServeFixture(t, "argo-helm", testChartRepo)
 	t.Run("Invalid", func(t *testing.T) {
 		client := NewClient("", HelmCreds{}, false, "", "")
 		_, err := client.GetIndex(t.Context(), false, 10000)
 		require.Error(t, err)
 	})
 	t.Run("Stable", func(t *testing.T) {
-		client := NewClient("https://argoproj.github.io/argo-helm", HelmCreds{}, false, "", "")
-		index, err := client.GetIndex(t.Context(), false, 10000)
+		client := NewClient(repo, HelmCreds{CAPath: ca}, false, "", "")
+		index, err := client.GetIndex(t.Context(), false, math.MaxInt64)
 		require.NoError(t, err)
 		assert.NotNil(t, index)
 	})
 	t.Run("BasicAuth", func(t *testing.T) {
-		client := NewClient("https://argoproj.github.io/argo-helm", HelmCreds{
+		client := NewClient(repo, HelmCreds{
+			CAPath:   ca,
 			Username: "my-password",
 			Password: "my-username",
 		}, false, "", "")
-		index, err := client.GetIndex(t.Context(), false, 10000)
+		index, err := client.GetIndex(t.Context(), false, math.MaxInt64)
 		require.NoError(t, err)
 		assert.NotNil(t, index)
 	})
@@ -75,7 +80,7 @@ func TestIndex(t *testing.T) {
 		err := yaml.NewEncoder(&data).Encode(fakeIndex)
 		require.NoError(t, err)
 
-		client := NewClient("https://argoproj.github.io/argo-helm", HelmCreds{}, false, "", "", WithIndexCache(&fakeIndexCache{data: data.Bytes()}))
+		client := NewClient(repo, HelmCreds{CAPath: ca}, false, "", "", WithIndexCache(&fakeIndexCache{data: data.Bytes()}))
 		index, err := client.GetIndex(t.Context(), false, 10000)
 
 		require.NoError(t, err)
@@ -83,7 +88,7 @@ func TestIndex(t *testing.T) {
 	})
 
 	t.Run("Limited", func(t *testing.T) {
-		client := NewClient("https://argoproj.github.io/argo-helm", HelmCreds{}, false, "", "")
+		client := NewClient(repo, HelmCreds{CAPath: ca}, false, "", "")
 		_, err := client.GetIndex(t.Context(), false, 100)
 
 		assert.ErrorContains(t, err, "unexpected end of stream")
@@ -91,7 +96,8 @@ func TestIndex(t *testing.T) {
 }
 
 func Test_nativeHelmChart_ExtractChart(t *testing.T) {
-	client := NewClient("https://argoproj.github.io/argo-helm", HelmCreds{}, false, "", "")
+	repo, ca := path.ServeFixture(t, "argo-helm", testChartRepo)
+	client := NewClient(repo, HelmCreds{CAPath: ca}, false, "", "")
 	path, closer, err := client.ExtractChart(t.Context(), "argo-cd", "0.7.1", false, math.MaxInt64, true)
 	require.NoError(t, err)
 	defer utilio.Close(closer)
@@ -101,13 +107,15 @@ func Test_nativeHelmChart_ExtractChart(t *testing.T) {
 }
 
 func Test_nativeHelmChart_ExtractChartWithLimiter(t *testing.T) {
-	client := NewClient("https://argoproj.github.io/argo-helm", HelmCreds{}, false, "", "")
+	repo, ca := path.ServeFixture(t, "argo-helm", testChartRepo)
+	client := NewClient(repo, HelmCreds{CAPath: ca}, false, "", "")
 	_, _, err := client.ExtractChart(t.Context(), "argo-cd", "0.7.1", false, 100, false)
 	require.Error(t, err, "error while iterating on tar reader: unexpected EOF")
 }
 
 func Test_nativeHelmChart_ExtractChart_insecure(t *testing.T) {
-	client := NewClient("https://argoproj.github.io/argo-helm", HelmCreds{InsecureSkipVerify: true}, false, "", "")
+	repo, _ := path.ServeFixture(t, "argo-helm", testChartRepo)
+	client := NewClient(repo, HelmCreds{InsecureSkipVerify: true}, false, "", "")
 	path, closer, err := client.ExtractChart(t.Context(), "argo-cd", "0.7.1", false, math.MaxInt64, true)
 	require.NoError(t, err)
 	defer utilio.Close(closer)
