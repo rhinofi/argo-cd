@@ -5899,6 +5899,25 @@ func TestUpdateRevisionForPaths_LastSyncedBase(t *testing.T) {
 		return err == nil
 	}
 
+	t.Run("legacy rename cache entry cannot hide removal from app path", func(t *testing.T) {
+		sourcePath := "app/deploy.yaml"
+		destinationPath := "sibling/deploy.yaml"
+		s, cacheMocks := newService(t, []string{sourcePath, destinationPath}, nil)
+		request := newRequest(revLastSynced)
+		request.Paths = []string{"app"}
+
+		// Seed the exact key and payload written before ChangedFiles started using --no-renames.
+		// Using SetGitFilesChanges here would instead exercise the current writer's format.
+		key := fmt.Sprintf("gitFilesChanges|%s|%s|%s|1.8.3", request.Repo.Repo, revResolved, revLastSynced)
+		require.NoError(t, cacheMocks.cacheutilCache.GetClient().Set(&cacheutil.Item{
+			Key: key, Object: []string{destinationPath},
+		}))
+
+		resp, err := s.UpdateRevisionForPaths(t.Context(), request)
+		require.NoError(t, err)
+		assert.True(t, resp.Changes, "moving a file out of app/ must trigger sync after an upgrade")
+	})
+
 	t.Run("changes since last sync, none since compared: changes reported and cache transferred", func(t *testing.T) {
 		s, cacheMocks := newService(t, []string{"app.yaml"}, nil)
 		request := newRequest(revCompared)
@@ -6215,6 +6234,57 @@ func TestUpdateRevisionForPaths_RenameThenDelete(t *testing.T) {
 	assert.True(t, resp.Changes, "the deployment under app/ was deleted since the last sync")
 }
 
+func TestUpdateRevisionForPaths_ChartReleaseWithUnrelatedValuesCommit(t *testing.T) {
+	const chartRepo = "registry.example.org/charts"
+	const valuesRepo = "https://example.org/values.git"
+	const oldVersion = "1.0.0"
+	const newVersion = "1.1.0"
+	oldRef, newRef := strings.Repeat("a", 40), strings.Repeat("b", 40)
+
+	s, _, cacheMocks := newServiceWithOpt(t, func(gitClient *gitmocks.Client, helmClient *helmmocks.Client, _ *ocimocks.Client, paths *iomocks.TempPaths) {
+		gitClient.EXPECT().LsRemote(oldRef).Return(oldRef, nil)
+		gitClient.EXPECT().LsRemote(newRef).Return(newRef, nil)
+		paths.EXPECT().GetPath(mock.Anything).Return(".", nil)
+		helmClient.EXPECT().GetTags(mock.Anything, "chart", false).Return([]string{oldVersion, newVersion}, nil)
+	}, ".")
+	refs := func(revision string) v1alpha1.RefTargetRevisionMapping {
+		return v1alpha1.RefTargetRevisionMapping{"$values": {Repo: v1alpha1.Repository{Repo: valuesRepo}, TargetRevision: revision}}
+	}
+	request := &apiclient.UpdateRevisionForPathsRequest{
+		Repo: &v1alpha1.Repository{Type: "helm", Repo: chartRepo},
+		ApplicationSource: &v1alpha1.ApplicationSource{
+			RepoURL: chartRepo, Chart: "chart", TargetRevision: "1.*",
+			Helm: &v1alpha1.ApplicationSourceHelm{ValueFiles: []string{"$values/app/values.yaml"}},
+		},
+		Revision:             "1.*",
+		SyncedRevision:       oldVersion,
+		LastSyncedRevision:   oldVersion,
+		Paths:                []string{"app"},
+		HasMultipleSources:   true,
+		RefSources:           refs(newRef),
+		SyncedRefSources:     refs(oldRef),
+		LastSyncedRefSources: refs(oldRef),
+	}
+	refSHAs := func(revision string) cache.ResolvedRevisions {
+		return cache.ResolvedRevisions{git.NormalizeGitURL(valuesRepo): revision}
+	}
+	oldKey := cache.NewManifestKey(oldVersion, request.ApplicationSource, refs(oldRef), "", "", "", "", "", nil, request, refSHAs(oldRef))
+	oldManifest := &cache.CachedManifestResponse{ManifestResponse: &apiclient.ManifestResponse{
+		Manifests: []string{"old chart contents"}, Revision: oldVersion,
+	}}
+	require.NoError(t, cacheMocks.cache.SetManifests(oldKey, oldManifest))
+	require.NoError(t, cacheMocks.cache.SetGitFilesChanges(valuesRepo, newRef, oldRef, []string{"unrelated.txt"}))
+
+	resp, err := s.UpdateRevisionForPaths(t.Context(), request)
+	require.NoError(t, err)
+	require.True(t, resp.Changes)
+	require.Equal(t, newVersion, resp.Revision)
+	newKey := cache.NewManifestKey(newVersion, request.ApplicationSource, refs(newRef), "", "", "", "", "", nil, request, refSHAs(newRef))
+	var cached cache.CachedManifestResponse
+	err = cacheMocks.cache.GetManifests(newKey, &cached)
+	assert.ErrorIs(t, err, cache.ErrCacheMiss, "the new release must generate its own manifests")
+}
+
 func TestUpdateRevisionForPaths_NonGitSourceUsesLastSyncedVersion(t *testing.T) {
 	// Non-git (helm/OCI) contents are never path-diffed, so a version move since the last sync attempt
 	// must count as a change, or a new chart version would never auto-sync under the annotation.
@@ -6230,6 +6300,17 @@ func TestUpdateRevisionForPaths_NonGitSourceUsesLastSyncedVersion(t *testing.T) 
 			ApplicationSource:  &v1alpha1.ApplicationSource{Chart: "test", TargetRevision: revision},
 		}
 	}
+
+	t.Run("registry error after switching chart version constraint", func(t *testing.T) {
+		s, _, _ := newServiceWithOpt(t, func(_ *gitmocks.Client, helmClient *helmmocks.Client, _ *ocimocks.Client, _ *iomocks.TempPaths) {
+			helmClient.EXPECT().GetTags(mock.Anything, "test", false).Return(nil, errors.New("registry unavailable"))
+		}, ".")
+		request := newRequest("1.2.3", "2.*")
+		request.SyncedRevision = "1.2.3"
+
+		_, err := s.UpdateRevisionForPaths(t.Context(), request)
+		require.ErrorContains(t, err, "registry unavailable", "the last compared version is outside the requested constraint")
+	})
 
 	t.Run("version moved since last sync reports changes", func(t *testing.T) {
 		s, _, _ := newServiceWithOpt(t, func(_ *gitmocks.Client, _ *helmmocks.Client, _ *ocimocks.Client, _ *iomocks.TempPaths) {}, ".")
@@ -6452,6 +6533,45 @@ func TestUpdateRevisionForPaths_ConcurrentColdCache(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestUpdateRevisionForPaths_ShallowRepoWithPrunedSyncBase(t *testing.T) {
+	dir := t.TempDir()
+	runGit(t, dir, "init", "-b", "main")
+	runGit(t, dir, "config", "user.name", "test")
+	runGit(t, dir, "config", "user.email", "test@example.org")
+	runGit(t, dir, "config", "commit.gpgsign", "false")
+	runGit(t, dir, "commit", "--allow-empty", "-m", "last sync")
+	lastSync := strings.TrimSpace(runGit(t, dir, "rev-parse", "HEAD"))
+
+	// Rewrite the remote and prune the old tip so fetching the sync base can never succeed.
+	runGit(t, dir, "commit", "--amend", "--allow-empty", "-m", "rewritten root")
+	compared := strings.TrimSpace(runGit(t, dir, "rev-parse", "HEAD"))
+	runGit(t, dir, "reflog", "expire", "--expire=now", "--all")
+	runGit(t, dir, "gc", "--prune=now")
+	checkObject := exec.CommandContext(t.Context(), "git", "-C", dir, "cat-file", "-e", lastSync)
+	require.IsType(t, &exec.ExitError{}, checkObject.Run())
+	require.NoError(t, os.Mkdir(filepath.Join(dir, "app"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "app", "deploy.yaml"), []byte("kind: Deployment\n"), 0o644))
+	runGit(t, dir, "add", "app/deploy.yaml")
+	runGit(t, dir, "commit", "-m", "add deployment")
+	head := strings.TrimSpace(runGit(t, dir, "rev-parse", "HEAD"))
+
+	cacheMocks := newCacheMocks()
+	t.Cleanup(cacheMocks.mockCache.StopRedisCallback)
+	s := NewService(metrics.NewMetricsServer(), cacheMocks.cache, RepoServerInitConstants{}, &git.NoopCredsStore{}, t.TempDir())
+	s.gitRepoInitializer = func(_ string) goio.Closer { return utilio.NopCloser }
+	resp, err := s.UpdateRevisionForPaths(t.Context(), &apiclient.UpdateRevisionForPathsRequest{
+		Repo:               &v1alpha1.Repository{Repo: "file://" + dir, Type: "git", Depth: 1},
+		ApplicationSource:  &v1alpha1.ApplicationSource{Path: "app"},
+		Paths:              []string{"app"},
+		Revision:           head,
+		SyncedRevision:     compared,
+		LastSyncedRevision: lastSync,
+	})
+	require.NoError(t, err, "a permanently missing base must allow a full sync when the new commit changes app/")
+	require.True(t, resp.Changes)
+	assert.Equal(t, head, resp.Revision)
 }
 
 // A synced revision that cannot be fetched (e.g. force-pushed away) falls back to treating the
