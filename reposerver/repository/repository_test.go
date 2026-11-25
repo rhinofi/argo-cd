@@ -6417,38 +6417,40 @@ func TestUpdateRevisionForPaths_NonGitSourceUsesLastSyncedVersion(t *testing.T) 
 		// into the 1.1.0 cache key.
 		shaOld := "1e67a504d03def3a6a1125d934cb511680f72555"
 		shaNew := "2f78b615e14efa4b7b2236e045dc622791a83666"
+		changedFilesCalled := false
 		s, _, cacheMocks := newServiceWithOpt(t, func(gitClient *gitmocks.Client, _ *helmmocks.Client, _ *ocimocks.Client, paths *iomocks.TempPaths) {
 			gitClient.EXPECT().Init().Return(nil)
 			gitClient.EXPECT().Fetch(mock.Anything, mock.Anything, mock.Anything).Return(nil)
 			gitClient.EXPECT().IsRevisionPresent(mock.Anything, mock.Anything).Return(false)
 			gitClient.EXPECT().Checkout(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return("", nil)
-			gitClient.EXPECT().LsRemote("HEAD").Return(shaNew, nil)
-			gitClient.EXPECT().LsRemote(shaOld).Return(shaOld, nil)
+			gitClient.EXPECT().LsRemote("HEAD").Return(shaNew, nil).Once()
+			gitClient.EXPECT().LsRemote(shaOld).Return(shaOld, nil).Once()
 			gitClient.EXPECT().Root().Return("")
-			gitClient.EXPECT().ChangedFiles(mock.Anything, shaOld, shaNew).Return([]string{"unrelated/file.yaml"}, nil)
+			gitClient.EXPECT().ChangedFiles(mock.Anything, shaOld, shaNew).Run(func(_ context.Context, _, _ string) {
+				changedFilesCalled = true
+			}).Return([]string{"unrelated/file.yaml"}, nil).Once()
 			paths.EXPECT().GetPath(mock.Anything).Return(".", nil)
 			paths.EXPECT().GetPathIfExists(mock.Anything).Return(".")
 		}, ".")
 		refRepo := v1alpha1.Repository{Repo: "a-url.com"}
+		refsFor := func(rev string) v1alpha1.RefTargetRevisionMapping {
+			return v1alpha1.RefTargetRevisionMapping{
+				"$values": {Repo: refRepo, TargetRevision: rev},
+			}
+		}
 		request := newRequest("1.0.0", "1.1.0")
 		request.SyncedRevision = "1.0.0"
 		request.Paths = []string{"values"}
 		request.HasMultipleSources = true
 		request.ApplicationSource.Helm = &v1alpha1.ApplicationSourceHelm{ValueFiles: []string{"$values/values/app.yaml"}}
-		request.RefSources = v1alpha1.RefTargetRevisionMapping{
-			"$values": {Repo: refRepo, TargetRevision: "HEAD"},
-		}
-		request.SyncedRefSources = v1alpha1.RefTargetRevisionMapping{
-			"$values": {Repo: refRepo, TargetRevision: shaOld},
-		}
-		request.LastSyncedRefSources = v1alpha1.RefTargetRevisionMapping{
-			"$values": {Repo: refRepo, TargetRevision: shaOld},
-		}
+		request.RefSources = refsFor("HEAD")
+		request.SyncedRefSources = refsFor(shaOld)
+		request.LastSyncedRefSources = refsFor(shaOld)
 
-		oldKey := cache.NewManifestKey("1.0.0", request.ApplicationSource, request.GetRefSources(), request.GetNamespace(),
+		oldKey := cache.NewManifestKey("1.0.0", request.ApplicationSource, refsFor(shaOld), request.GetNamespace(),
 			request.GetTrackingMethod(), request.GetAppLabelKey(), request.GetAppName(), request.GetInstallationID(),
 			request.GetSourceIntegrity(), request, map[string]string{git.NormalizeGitURL(refRepo.Repo): shaOld})
-		newKey := cache.NewManifestKey("1.1.0", request.ApplicationSource, request.GetRefSources(), request.GetNamespace(),
+		newKey := cache.NewManifestKey("1.1.0", request.ApplicationSource, refsFor(shaNew), request.GetNamespace(),
 			request.GetTrackingMethod(), request.GetAppLabelKey(), request.GetAppName(), request.GetInstallationID(),
 			request.GetSourceIntegrity(), request, map[string]string{git.NormalizeGitURL(refRepo.Repo): shaNew})
 		require.NoError(t, cacheMocks.cache.SetManifests(oldKey, &cache.CachedManifestResponse{
@@ -6457,9 +6459,11 @@ func TestUpdateRevisionForPaths_NonGitSourceUsesLastSyncedVersion(t *testing.T) 
 				Manifests: []string{`{"kind":"ConfigMap","metadata":{"name":"old-1.0.0"}}`},
 			},
 		}))
+		require.Equal(t, "HEAD", request.RefSources["$values"].TargetRevision, "seeding old cache key must not mutate request.RefSources")
 
 		resp, err := s.UpdateRevisionForPaths(t.Context(), request)
 		require.NoError(t, err)
+		assert.True(t, changedFilesCalled, "ref diff must actually execute so the non-git cache-transfer guard is exercised")
 		assert.True(t, resp.Changes)
 		assert.Equal(t, "1.1.0", resp.Revision)
 

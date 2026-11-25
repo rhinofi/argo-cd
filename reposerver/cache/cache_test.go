@@ -903,6 +903,26 @@ func TestGetGitFilesChanges(t *testing.T) {
 	})
 }
 
+func TestNewManifestKey_DoesNotMutateRefSources(t *testing.T) {
+	t.Parallel()
+	refRepo := v1alpha1.Repository{Repo: "https://example.org/values.git"}
+	refSources := v1alpha1.RefTargetRevisionMapping{
+		"$values": {Repo: refRepo, TargetRevision: "HEAD"},
+	}
+	appSrc := &v1alpha1.ApplicationSource{
+		RepoURL:        "registry.example.org/charts",
+		Chart:          "chart",
+		TargetRevision: "1.0.0",
+		Helm:           &v1alpha1.ApplicationSourceHelm{ValueFiles: []string{"$values/app/values.yaml"}},
+	}
+	sha := "1e67a504d03def3a6a1125d934cb511680f72555"
+	key := NewManifestKey("1.0.0", appSrc, refSources, "default", "", "", "my-app", "", nil, nil, ResolvedRevisions{
+		"https://example.org/values": sha,
+	})
+	assert.NotEmpty(t, key.String())
+	assert.Equal(t, "HEAD", refSources["$values"].TargetRevision, "NewManifestKey.String() must not mutate caller RefTarget pointers")
+}
+
 func TestGetOciDirectories(t *testing.T) {
 	t.Run("GetOciDirectories cache miss", func(t *testing.T) {
 		fixtures := newFixtures()
