@@ -3001,21 +3001,58 @@ func Test_EvaluateAppRevisionsChanges(t *testing.T) {
 			expectedResolvedRevisions: []string{"any-revision"},
 		},
 		{
-			name: "same revision no ref sources returns false",
+			name: "same commit SHA no ref sources returns false",
 			app: func() *v1alpha1.Application {
 				app := newFakeApp()
-				app.Status.Sync.Revision = "abc123"
+				app.Status.Sync.Revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 				return app
 			}(),
 			sources: func() []v1alpha1.ApplicationSource {
 				app := newFakeApp()
 				return []v1alpha1.ApplicationSource{app.Spec.GetSource()}
 			}(),
-			revisions:                 []string{"abc123"},
+			revisions:                 []string{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
 			data:                      fakeData{},
 			sendRuntimeState:          false,
 			expectedHasChanges:        false,
-			expectedResolvedRevisions: []string{"abc123"},
+			expectedResolvedRevisions: []string{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+		},
+		{
+			name: "same symbolic git ref does not short-circuit to false",
+			app: func() *v1alpha1.Application {
+				app := newFakeApp()
+				app.Spec.Source.TargetRevision = "main"
+				app.Status.Sync.Revision = "main"
+				return app
+			}(),
+			sources: func() []v1alpha1.ApplicationSource {
+				app := newFakeApp()
+				app.Spec.Source.TargetRevision = "main"
+				return []v1alpha1.ApplicationSource{app.Spec.GetSource()}
+			}(),
+			revisions:                 []string{"main"},
+			data:                      fakeData{},
+			sendRuntimeState:          false,
+			expectedHasChanges:        true,
+			expectedResolvedRevisions: []string{"main"},
+		},
+		{
+			name: "unknown sync status never short-circuits on matching commit SHA",
+			app: func() *v1alpha1.Application {
+				app := newFakeApp()
+				app.Status.Sync.Status = v1alpha1.SyncStatusCodeUnknown
+				app.Status.Sync.Revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+				return app
+			}(),
+			sources: func() []v1alpha1.ApplicationSource {
+				app := newFakeApp()
+				return []v1alpha1.ApplicationSource{app.Spec.GetSource()}
+			}(),
+			revisions:                 []string{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+			data:                      fakeData{},
+			sendRuntimeState:          false,
+			expectedHasChanges:        true,
+			expectedResolvedRevisions: []string{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
 		},
 		{
 			name: "dry source with same SHA returns false",
@@ -3032,7 +3069,7 @@ func Test_EvaluateAppRevisionsChanges(t *testing.T) {
 						Path:         "sync-path",
 					},
 				}
-				app.Status.SourceHydrator.LastComparedDryRevision = "same-sha"
+				app.Status.SourceHydrator.LastComparedDryRevision = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 				return app
 			}(),
 			sources: func() []v1alpha1.ApplicationSource {
@@ -3047,11 +3084,11 @@ func Test_EvaluateAppRevisionsChanges(t *testing.T) {
 				drySource := app.Spec.SourceHydrator.GetDrySource()
 				return []v1alpha1.ApplicationSource{drySource}
 			}(),
-			revisions:                 []string{"same-sha"},
+			revisions:                 []string{"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
 			data:                      fakeData{},
 			sendRuntimeState:          false,
 			expectedHasChanges:        false,
-			expectedResolvedRevisions: []string{"same-sha"},
+			expectedResolvedRevisions: []string{"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
 		},
 		{
 			name: "dry source with annotation and changes detected",
@@ -3246,4 +3283,48 @@ func TestShouldUseServerSideDiff(t *testing.T) {
 			assert.Equal(t, tc.expected, shouldUseServerSideDiff(tc.app, tc.controllerLevelSSD))
 		})
 	}
+}
+
+func TestCompareAppStateRepoErrorPreservesRevision(t *testing.T) {
+	revA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	revB := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+	t.Run("single source preserves last resolved SHA instead of symbolic TargetRevision", func(t *testing.T) {
+		app := newFakeApp()
+		app.Spec.Source.TargetRevision = "master"
+		app.Status.Sync = v1alpha1.SyncStatus{
+			Status:   v1alpha1.SyncStatusCodeSynced,
+			Revision: revA,
+		}
+		ctrl := newFakeController(t.Context(), &fakeData{manifestResponses: make([]*apiclient.ManifestResponse, 1)}, errors.New("git fetch timeout"))
+		sources := []v1alpha1.ApplicationSource{app.Spec.GetSource()}
+		revisions := []string{"master"}
+
+		// noRevisionCache=true bypasses repoErrorGracePeriod (as on webhook/normal refresh).
+		compRes, err := ctrl.appStateManager.CompareAppState(t.Context(), app, &defaultProj, revisions, sources, false, true, nil, false)
+		require.NoError(t, err)
+		require.NotNil(t, compRes)
+		assert.Equal(t, v1alpha1.SyncStatusCodeUnknown, compRes.syncStatus.Status)
+		assert.Equal(t, revA, compRes.syncStatus.Revision, "repo error must preserve previously resolved SHA rather than overwriting with unresolved targetRevision")
+	})
+
+	t.Run("multi source preserves last resolved SHAs instead of wiping Revisions", func(t *testing.T) {
+		app := newFakeMultiSourceApp()
+		app.Status.Sync = v1alpha1.SyncStatus{
+			Status:    v1alpha1.SyncStatusCodeSynced,
+			Revisions: []string{revA, revB},
+		}
+		ctrl := newFakeController(t.Context(), &fakeData{manifestResponses: make([]*apiclient.ManifestResponse, 2)}, errors.New("git auth failed"))
+		sources := app.Spec.GetSources()
+		revisions := make([]string, len(sources))
+		for i, src := range sources {
+			revisions[i] = src.TargetRevision
+		}
+
+		compRes, err := ctrl.appStateManager.CompareAppState(t.Context(), app, &defaultProj, revisions, sources, false, true, nil, true)
+		require.NoError(t, err)
+		require.NotNil(t, compRes)
+		assert.Equal(t, v1alpha1.SyncStatusCodeUnknown, compRes.syncStatus.Status)
+		assert.Equal(t, []string{revA, revB}, compRes.syncStatus.Revisions)
+	})
 }

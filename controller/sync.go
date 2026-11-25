@@ -218,10 +218,14 @@ func (m *appStateManager) SyncAppState(ctx context.Context, app *v1alpha1.Applic
 		return
 	}
 
-	// We are now guaranteed to have a concrete commit SHA. Save this in the sync result revision so that we remember
-	// what we should be syncing to when resuming operations.
-	state.SyncResult.Revision = compareResult.syncStatus.Revision
-	state.SyncResult.Revisions = compareResult.syncStatus.Revisions
+	// We are now guaranteed to have a concrete commit SHA when comparison succeeded. Save this in the sync
+	// result revision so that we remember what we should be syncing to when resuming operations.
+	// On Unknown (e.g. ComparisonError), preserve the attempted revision rather than overwriting it with the
+	// preserved previous Status.Sync.Revision.
+	if compareResult.syncStatus.Status != v1alpha1.SyncStatusCodeUnknown {
+		state.SyncResult.Revision = compareResult.syncStatus.Revision
+		state.SyncResult.Revisions = compareResult.syncStatus.Revisions
+	}
 
 	// validates if it should fail the sync on that revision if it finds shared resources
 	hasSharedResource, sharedResourceMessage := hasSharedResourceCondition(app)

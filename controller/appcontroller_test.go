@@ -1042,6 +1042,188 @@ func TestAutoSyncCompareWithRecentAfterBlockedSync(t *testing.T) {
 	}
 }
 
+func TestAutoSyncSyncedToUnknownToOutOfSyncTriggersFullSync(t *testing.T) {
+	// Regression for Synced -> Unknown -> OutOfSync after a repo-server error (git fetch timeout / auth failure):
+	// recovery onto a new commit must trigger a full sync (empty op.Sync.Resources so Sync hooks run and
+	// status.history is recorded), never a self-heal partial sync.
+	revA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	revB := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+	cases := []struct {
+		name              string
+		manifestGenPaths  string
+		selfHeal          bool
+		corruptedRevision string // simulates pre-fix etcd state where Status.Sync.Revision was left as "master"
+	}{
+		{
+			name:             "without manifest-generate-paths, selfHeal=true, full transition",
+			manifestGenPaths: "",
+			selfHeal:         true,
+		},
+		{
+			name:             "without manifest-generate-paths, selfHeal=false, full transition",
+			manifestGenPaths: "",
+			selfHeal:         false,
+		},
+		{
+			name:              "without manifest-generate-paths, selfHeal=true, pre-existing unresolved revision on Unknown",
+			manifestGenPaths:  "",
+			selfHeal:          true,
+			corruptedRevision: "master",
+		},
+		{
+			name:             "with manifest-generate-paths, selfHeal=true, full transition",
+			manifestGenPaths: ".",
+			selfHeal:         true,
+		},
+		{
+			name:              "with manifest-generate-paths, selfHeal=true, pre-existing unresolved revision on Unknown",
+			manifestGenPaths:  ".",
+			selfHeal:          true,
+			corruptedRevision: "master",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			app := newFakeApp()
+			app.Spec.Source.TargetRevision = "master"
+			app.Spec.SyncPolicy.Automated.Prune = new(true)
+			app.Spec.SyncPolicy.Automated.SelfHeal = new(tc.selfHeal)
+			if tc.manifestGenPaths != "" {
+				app.Annotations = map[string]string{v1alpha1.AnnotationKeyManifestGeneratePaths: tc.manifestGenPaths}
+			}
+			app.Status.Sync = v1alpha1.SyncStatus{
+				Status:   v1alpha1.SyncStatusCodeSynced,
+				Revision: revA,
+			}
+			app.Status.OperationState = &v1alpha1.OperationState{
+				Phase:      synccommon.OperationSucceeded,
+				FinishedAt: &metav1.Time{Time: time.Now().Add(-10 * time.Minute)},
+				SyncResult: &v1alpha1.SyncOperationResult{
+					Revision: revA,
+					Source:   app.Spec.GetSource(),
+				},
+			}
+
+			// Step 1: Repo-server error pushes app Synced -> Unknown (bypassing grace period via noRevisionCache=true).
+			if tc.corruptedRevision != "" {
+				app.Status.Sync.Status = v1alpha1.SyncStatusCodeUnknown
+				app.Status.Sync.Revision = tc.corruptedRevision
+			} else {
+				errCtrl := newFakeController(t.Context(), &fakeData{
+					apps:                           []runtime.Object{app.DeepCopy()},
+					manifestResponses:              make([]*apiclient.ManifestResponse, 1),
+					updateRevisionForPathsResponse: &apiclient.UpdateRevisionForPathsResponse{Changes: true, Revision: "master"},
+				}, errors.New("git fetch origin failed: signal: terminated"))
+				compErrRes, err := errCtrl.appStateManager.CompareAppState(t.Context(), app, &defaultProj, []string{"master"}, []v1alpha1.ApplicationSource{app.Spec.GetSource()}, false, true, nil, false)
+				require.NoError(t, err)
+				require.NotNil(t, compErrRes)
+				assert.Equal(t, v1alpha1.SyncStatusCodeUnknown, compErrRes.syncStatus.Status)
+				assert.Equal(t, revA, compErrRes.syncStatus.Revision)
+				app.Status.Sync = *compErrRes.syncStatus
+			}
+
+			// Step 2: Repo-server recovers and resolves "master" -> revB.
+			var updateReq *apiclient.UpdateRevisionForPathsRequest
+			ctrl := newFakeController(t.Context(), &fakeData{
+				apps: []runtime.Object{app.DeepCopy()},
+				manifestResponse: &apiclient.ManifestResponse{
+					Manifests: []string{},
+					Namespace: test.FakeDestNamespace,
+					Server:    test.FakeClusterURL,
+					Revision:  revB,
+				},
+				updateRevisionForPathsResponse: &apiclient.UpdateRevisionForPathsResponse{
+					Changes:  true,
+					Revision: revB,
+				},
+				onUpdateRevisionForPaths: func(r *apiclient.UpdateRevisionForPathsRequest) { updateReq = r },
+			}, nil)
+
+			_, _, revisionsMayHaveChanges, err := ctrl.appStateManager.GetRepoObjs(
+				t.Context(), app, []v1alpha1.ApplicationSource{app.Spec.GetSource()}, "", []string{"master"},
+				false, false, defaultProj.EffectiveSourceIntegrity(), &defaultProj, false,
+			)
+			require.NoError(t, err)
+			assert.True(t, revisionsMayHaveChanges)
+			if tc.manifestGenPaths != "" {
+				require.NotNil(t, updateReq)
+				assert.Equal(t, revA, updateReq.LastSyncedRevision)
+			}
+
+			syncStatus := v1alpha1.SyncStatus{Status: v1alpha1.SyncStatusCodeOutOfSync, Revision: revB}
+			cond, _ := ctrl.autoSync(t.Context(), app, &syncStatus, []v1alpha1.ResourceStatus{{
+				Group: "apps", Kind: kube.DeploymentKind, Name: "collateral-manager", Status: v1alpha1.SyncStatusCodeOutOfSync,
+			}}, revisionsMayHaveChanges)
+			assert.Nil(t, cond)
+
+			updatedApp, err := ctrl.applicationClientset.ArgoprojV1alpha1().Applications(test.FakeArgoCDNamespace).Get(t.Context(), app.Name, metav1.GetOptions{})
+			require.NoError(t, err)
+			require.NotNil(t, updatedApp.Operation, "expected automated sync operation to be created")
+			require.NotNil(t, updatedApp.Operation.Sync)
+			assert.Equal(t, revB, updatedApp.Operation.Sync.Revision)
+			assert.Empty(t, updatedApp.Operation.Sync.Resources, "must be a full sync so Sync hooks run and history is recorded")
+			assert.Zero(t, updatedApp.Operation.Sync.SelfHealAttemptsCount, "must not enter self-heal partial sync branch")
+		})
+	}
+}
+
+func TestAutoSyncManifestGeneratePathsNewCommit_SelfHeal(t *testing.T) {
+	// Regression for #22795 & #27875 with selfHeal=true:
+	// - When a new commit touched app paths since last sync, auto-sync must run a FULL sync (hooks run).
+	// - When live resources drifted with no path changes since last sync, selfHeal must still run a partial sync.
+	revA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	revB := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+	runCase := func(t *testing.T, changes bool) *v1alpha1.Application {
+		t.Helper()
+		app := newFakeApp()
+		app.Annotations = map[string]string{v1alpha1.AnnotationKeyManifestGeneratePaths: "."}
+		app.Spec.SyncPolicy.Automated.SelfHeal = new(true)
+		app.Status.Sync = v1alpha1.SyncStatus{Status: v1alpha1.SyncStatusCodeOutOfSync, Revision: revB}
+		app.Status.OperationState.FinishedAt = &metav1.Time{Time: time.Now().Add(-10 * time.Minute)}
+		require.Equal(t, revA, app.Status.OperationState.SyncResult.Revision)
+
+		var req *apiclient.UpdateRevisionForPathsRequest
+		ctrl := newFakeController(t.Context(), &fakeData{
+			apps:                           []runtime.Object{app},
+			manifestResponse:               &apiclient.ManifestResponse{Manifests: []string{}, Namespace: test.FakeDestNamespace, Server: test.FakeClusterURL, Revision: revB},
+			updateRevisionForPathsResponse: &apiclient.UpdateRevisionForPathsResponse{Changes: changes, Revision: revB},
+			onUpdateRevisionForPaths:       func(r *apiclient.UpdateRevisionForPathsRequest) { req = r },
+		}, nil)
+
+		_, _, revisionsMayHaveChanges, err := ctrl.appStateManager.GetRepoObjs(t.Context(), app, []v1alpha1.ApplicationSource{app.Spec.GetSource()}, "", []string{revB}, false, false, defaultProj.EffectiveSourceIntegrity(), &defaultProj, false)
+		require.NoError(t, err)
+		require.NotNil(t, req)
+		assert.Equal(t, revA, req.LastSyncedRevision)
+		assert.Equal(t, changes, revisionsMayHaveChanges)
+
+		cond, _ := ctrl.autoSync(t.Context(), app, &app.Status.Sync, []v1alpha1.ResourceStatus{{Group: "apps", Kind: kube.DeploymentKind, Name: "guestbook", Status: v1alpha1.SyncStatusCodeOutOfSync}}, revisionsMayHaveChanges)
+		assert.Nil(t, cond)
+		app, err = ctrl.applicationClientset.ArgoprojV1alpha1().Applications(test.FakeArgoCDNamespace).Get(t.Context(), app.Name, metav1.GetOptions{})
+		require.NoError(t, err)
+		return app
+	}
+
+	t.Run("NewCommitWithChangesRunsFullSyncNotSelfHeal", func(t *testing.T) {
+		app := runCase(t, true)
+		require.NotNil(t, app.Operation)
+		require.NotNil(t, app.Operation.Sync)
+		assert.Equal(t, revB, app.Operation.Sync.Revision)
+		assert.Empty(t, app.Operation.Sync.Resources, "full sync required so PreSync/Sync/PostSync hooks execute")
+		assert.Zero(t, app.Operation.Sync.SelfHealAttemptsCount)
+	})
+
+	t.Run("ClusterDriftWithoutChangesStillRunsSelfHealPartialSync", func(t *testing.T) {
+		app := runCase(t, false)
+		require.NotNil(t, app.Operation)
+		require.NotNil(t, app.Operation.Sync)
+		assert.Len(t, app.Operation.Sync.Resources, 1, "drift self-heal must remain a partial sync")
+		assert.Equal(t, int64(1), app.Operation.Sync.SelfHealAttemptsCount)
+	})
+}
+
 func TestAutoSyncNotAllowEmpty(t *testing.T) {
 	app := newFakeApp()
 	app.Spec.SyncPolicy.Automated.Prune = new(true)
@@ -3512,6 +3694,64 @@ func TestSetOperationState_EmptySyncRevisionClearsPreviousRevision(t *testing.T)
 	require.NotNil(t, patchedApp.Status.OperationState.Operation.Sync)
 	assert.Empty(t, patchedApp.Status.OperationState.Operation.Sync.Revision,
 		"empty Sync.Revision (omitempty) must clear the previous revision if empty instead of preserving it")
+}
+
+func TestSetOperationState_FullSyncClearsPreviousSelectiveSyncFields(t *testing.T) {
+	// Regression guard for #28701 / #29332: replacing /status/operationState with JSON Patch must clear
+	// all omitempty fields from a prior selective/force sync so a resumed full sync never degrades to
+	// a partial sync or inherits stale force/prune/retry/syncResult state.
+	app := newFakeApp()
+	prevFinished := metav1.Now()
+	app.Status.OperationState = &v1alpha1.OperationState{
+		Phase:      synccommon.OperationSucceeded,
+		StartedAt:  prevFinished,
+		FinishedAt: &prevFinished,
+		RetryCount: 3,
+		Operation: v1alpha1.Operation{
+			Retry: v1alpha1.RetryStrategy{Limit: 5},
+			Sync: &v1alpha1.SyncOperation{
+				Revision:     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				Prune:        true,
+				SyncStrategy: &v1alpha1.SyncStrategy{Apply: &v1alpha1.SyncStrategyApply{Force: true}},
+				SyncOptions:  v1alpha1.SyncOptions{"Prune=true"},
+				Resources: []v1alpha1.SyncOperationResource{
+					{Group: "apps", Kind: "Deployment", Name: "collateral-manager", Namespace: "collateral-manager"},
+				},
+			},
+		},
+		SyncResult: &v1alpha1.SyncOperationResult{
+			Revision: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			Resources: v1alpha1.ResourceResults{
+				{Group: "batch", Kind: "Job", Name: "collateral-manager-mongo-indexes", HookPhase: synccommon.OperationSucceeded},
+			},
+		},
+	}
+
+	ctrl := newFakeController(t.Context(), &fakeData{apps: []runtime.Object{app.DeepCopy()}}, nil)
+
+	ctrl.setOperationState(t.Context(), app, &v1alpha1.OperationState{
+		Phase:     synccommon.OperationRunning,
+		StartedAt: metav1.Now(),
+		Operation: v1alpha1.Operation{
+			Sync: &v1alpha1.SyncOperation{},
+		},
+	})
+
+	patchedApp, err := ctrl.applicationClientset.ArgoprojV1alpha1().Applications(app.Namespace).Get(t.Context(), app.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.NotNil(t, patchedApp.Status.OperationState)
+	require.NotNil(t, patchedApp.Status.OperationState.Operation.Sync)
+
+	opState := patchedApp.Status.OperationState
+	assert.Empty(t, opState.Operation.Sync.Revision)
+	assert.Empty(t, opState.Operation.Sync.Resources)
+	assert.False(t, opState.Operation.Sync.Prune)
+	assert.Nil(t, opState.Operation.Sync.SyncStrategy)
+	assert.Empty(t, opState.Operation.Sync.SyncOptions)
+	assert.Zero(t, opState.Operation.Retry.Limit)
+	assert.Zero(t, opState.RetryCount)
+	assert.Nil(t, opState.SyncResult)
+	assert.Nil(t, opState.FinishedAt)
 }
 
 func TestSetOperationState_CompletionEventMessageRevision(t *testing.T) {

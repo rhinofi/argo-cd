@@ -2097,7 +2097,11 @@ func (ctrl *ApplicationController) processAppRefreshQueueItem() (processNext boo
 
 	canSync, _ := project.Spec.SyncWindows.Matches(app).CanSync(false, nil)
 	if canSync {
-		syncErrCond, opDuration := ctrl.autoSync(ctx, app, compareResult.syncStatus, compareResult.resources, compareResult.revisionsMayHaveChanges)
+		// Without manifest-generate-paths there are no path filters to honor, so never let
+		// revisionsMayHaveChanges=false disable revision comparison in alreadyAttemptedSync.
+		shouldCompareRevisions := compareResult.revisionsMayHaveChanges ||
+			app.GetAnnotation(appv1.AnnotationKeyManifestGeneratePaths) == ""
+		syncErrCond, opDuration := ctrl.autoSync(ctx, app, compareResult.syncStatus, compareResult.resources, shouldCompareRevisions)
 		setOpDuration = opDuration
 		if syncErrCond != nil {
 			app.Status.SetConditions(

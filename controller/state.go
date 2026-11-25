@@ -562,9 +562,14 @@ func (m *appStateManager) evaluateRevisionChanges(ctx context.Context, app *v1al
 		return revision, false, nil
 	}
 
-	if syncedRevision == revision && revision != "" && len(refSources) == 0 && (lastSyncedRevision == "" || lastSyncedRevision == revision) {
+	isGitSource := !source.IsHelm() && !source.IsOCI()
+	if app.Status.Sync.Status != v1alpha1.SyncStatusCodeUnknown &&
+		syncedRevision == revision && revision != "" && len(refSources) == 0 &&
+		(!isGitSource || git.IsCommitSHA(revision)) &&
+		(lastSyncedRevision == "" || lastSyncedRevision == revision) {
 		// if revisions are the same (and we are not using reference sources), we know there is no changes.
-		// A lagging last-synced revision still needs its own diff (#27875).
+		// Never short-circuit while recovering from Unknown or when a Git revision is an unresolved symbolic
+		// ref (e.g. "main" == "main"). A lagging last-synced revision still needs its own diff (#27875).
 		// TODO: Could be optimized to not call the repo server at all if we know this specific source does not use reference.
 		return revision, false, nil
 	}
@@ -758,7 +763,9 @@ func (m *appStateManager) CompareAppState(ctx context.Context, app *v1alpha1.App
 	ts := stats.NewTimingStats()
 	logCtx := log.WithFields(applog.GetAppLogFields(app))
 
-	// Build initial sync status
+	// Build initial sync status, preserving the previously known revision(s) so that early errors
+	// (e.g. getComparisonSettings or repo-server failures -> Unknown) never overwrite Status.Sync.Revision
+	// with an unresolved symbolic ref like "main" or wipe multi-source Revisions.
 	syncStatus := &v1alpha1.SyncStatus{
 		ComparedTo: v1alpha1.ComparedTo{
 			Destination:       app.Spec.Destination,
@@ -768,16 +775,14 @@ func (m *appStateManager) CompareAppState(ctx context.Context, app *v1alpha1.App
 	}
 	if hasMultipleSources {
 		syncStatus.ComparedTo.Sources = sources
-		syncStatus.Revisions = revisions
+		syncStatus.Revisions = slices.Clone(app.Status.Sync.Revisions)
 	} else {
 		if len(sources) > 0 {
 			syncStatus.ComparedTo.Source = sources[0]
 		} else {
 			logCtx.Warn("CompareAppState: sources should not be empty")
 		}
-		if len(revisions) > 0 {
-			syncStatus.Revision = revisions[0]
-		}
+		syncStatus.Revision = app.Status.Sync.Revision
 	}
 
 	appLabelKey, resourceOverrides, resFilter, installationID, trackingMethod, err := m.getComparisonSettings()
@@ -1171,11 +1176,20 @@ func (m *appStateManager) CompareAppState(ctx context.Context, app *v1alpha1.App
 
 	syncStatus.Status = syncCode
 
-	// Update the initial revision to the resolved manifest SHA
-	if hasMultipleSources {
-		syncStatus.Revisions = manifestRevisions
-	} else if len(manifestRevisions) > 0 {
-		syncStatus.Revision = manifestRevisions[0]
+	// Update the initial revision to the resolved manifest SHA only when comparison succeeded.
+	// On failedToLoadObjs (Status == Unknown), preserve the previously known revision(s).
+	if !failedToLoadObjs {
+		if hasMultipleSources {
+			if len(manifestRevisions) > 0 {
+				syncStatus.Revisions = manifestRevisions
+			} else {
+				syncStatus.Revisions = revisions
+			}
+		} else if len(manifestRevisions) > 0 {
+			syncStatus.Revision = manifestRevisions[0]
+		} else if len(revisions) > 0 {
+			syncStatus.Revision = revisions[0]
+		}
 	}
 
 	ts.AddCheckpoint("sync_ms")
