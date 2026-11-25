@@ -763,9 +763,10 @@ func (m *appStateManager) CompareAppState(ctx context.Context, app *v1alpha1.App
 	ts := stats.NewTimingStats()
 	logCtx := log.WithFields(applog.GetAppLogFields(app))
 
-	// Build initial sync status, preserving the previously known revision(s) so that early errors
-	// (e.g. getComparisonSettings or repo-server failures -> Unknown) never overwrite Status.Sync.Revision
-	// with an unresolved symbolic ref like "main" or wipe multi-source Revisions.
+	// Build initial sync status, preserving the previously known source(s) and revision(s) together
+	// so that early errors (e.g. getComparisonSettings or repo-server failures -> Unknown) never pair
+	// a new spec source with an old revision, overwrite Status.Sync.Revision with an unresolved symbolic
+	// ref like "main", or wipe multi-source Revisions.
 	syncStatus := &v1alpha1.SyncStatus{
 		ComparedTo: v1alpha1.ComparedTo{
 			Destination:       app.Spec.Destination,
@@ -774,10 +775,16 @@ func (m *appStateManager) CompareAppState(ctx context.Context, app *v1alpha1.App
 		Status: v1alpha1.SyncStatusCodeUnknown,
 	}
 	if hasMultipleSources {
-		syncStatus.ComparedTo.Sources = sources
+		if len(app.Status.Sync.ComparedTo.Sources) > 0 {
+			syncStatus.ComparedTo.Sources = app.Status.Sync.ComparedTo.Sources.DeepCopy()
+		} else {
+			syncStatus.ComparedTo.Sources = sources
+		}
 		syncStatus.Revisions = slices.Clone(app.Status.Sync.Revisions)
 	} else {
-		if len(sources) > 0 {
+		if !app.Status.Sync.ComparedTo.Source.Equals(&v1alpha1.ApplicationSource{}) {
+			syncStatus.ComparedTo.Source = *app.Status.Sync.ComparedTo.Source.DeepCopy()
+		} else if len(sources) > 0 {
 			syncStatus.ComparedTo.Source = sources[0]
 		} else {
 			logCtx.Warn("CompareAppState: sources should not be empty")
@@ -1176,19 +1183,25 @@ func (m *appStateManager) CompareAppState(ctx context.Context, app *v1alpha1.App
 
 	syncStatus.Status = syncCode
 
-	// Update the initial revision to the resolved manifest SHA only when comparison succeeded.
-	// On failedToLoadObjs (Status == Unknown), preserve the previously known revision(s).
+	// Update ComparedTo source(s) and resolved manifest SHA(s) together only when comparison succeeded.
+	// On failedToLoadObjs (Status == Unknown), keep the previously known source(s) and revision(s) paired.
 	if !failedToLoadObjs {
 		if hasMultipleSources {
+			syncStatus.ComparedTo.Sources = sources
 			if len(manifestRevisions) > 0 {
 				syncStatus.Revisions = manifestRevisions
 			} else {
 				syncStatus.Revisions = revisions
 			}
-		} else if len(manifestRevisions) > 0 {
-			syncStatus.Revision = manifestRevisions[0]
-		} else if len(revisions) > 0 {
-			syncStatus.Revision = revisions[0]
+		} else {
+			if len(sources) > 0 {
+				syncStatus.ComparedTo.Source = sources[0]
+			}
+			if len(manifestRevisions) > 0 {
+				syncStatus.Revision = manifestRevisions[0]
+			} else if len(revisions) > 0 {
+				syncStatus.Revision = revisions[0]
+			}
 		}
 	}
 

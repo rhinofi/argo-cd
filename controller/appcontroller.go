@@ -2049,6 +2049,10 @@ func (ctrl *ApplicationController) processAppRefreshQueueItem() (processNext boo
 
 	hasMultipleSources := app.Spec.HasMultipleSources()
 
+	// Never reuse Status.Sync.Revision(s) when recovering from Unknown: always resolve fresh
+	// target revisions from the spec so a stale revision cannot be synced after a failed comparison.
+	useRecentRevisions := comparisonLevel == CompareWithRecent && app.Status.Sync.Status != appv1.SyncStatusCodeUnknown
+
 	// If we have multiple sources, we use all the sources under `sources` field and ignore source under `source` field.
 	// else we use the source under the source field.
 	if hasMultipleSources {
@@ -2059,12 +2063,12 @@ func (ctrl *ApplicationController) processAppRefreshQueueItem() (processNext boo
 			sources = append(sources, source)
 			revisions = append(revisions, source.TargetRevision)
 		}
-		if comparisonLevel == CompareWithRecent {
+		if useRecentRevisions {
 			revisions = app.Status.Sync.Revisions
 		}
 	} else {
 		revision := app.Spec.GetSource().TargetRevision
-		if comparisonLevel == CompareWithRecent {
+		if useRecentRevisions {
 			revision = app.Status.Sync.Revision
 		}
 		revisions = append(revisions, revision)

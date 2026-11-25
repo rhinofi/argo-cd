@@ -1521,7 +1521,7 @@ func (m *nativeGitClient) ChangedFiles(ctx context.Context, revision string, tar
 		return []string{}, errors.New("invalid revision provided, must be SHA")
 	}
 
-	out, err := m.runCmd(ctx, "diff", "--name-only", fmt.Sprintf("%s..%s", revision, targetRevision))
+	out, err := m.runCmd(ctx, "diff", "--no-renames", "--name-only", fmt.Sprintf("%s..%s", revision, targetRevision))
 	if err != nil {
 		return nil, fmt.Errorf("failed to diff %s..%s: %w", revision, targetRevision, err)
 	}
