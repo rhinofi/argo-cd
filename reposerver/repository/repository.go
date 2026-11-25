@@ -3118,6 +3118,16 @@ func (s *Service) fetch(ctx context.Context, gitClient git.Client, targetRevisio
 	return err
 }
 
+func isRevisionNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "not our ref") ||
+		strings.Contains(msg, "unadvertised object") ||
+		strings.Contains(msg, "couldn't find remote ref")
+}
+
 func fetch(ctx context.Context, gitClient git.Client, targetRevisions []string, depth int64) error {
 	revisionPresent := true
 	for _, revision := range targetRevisions {
@@ -3133,9 +3143,14 @@ func fetch(ctx context.Context, gitClient git.Client, targetRevisions []string, 
 	if depth > 0 {
 		for _, revision := range targetRevisions {
 			if !gitClient.IsRevisionPresent(ctx, revision) {
-				// Not classified as ErrRevisionNotFound: servers without uploadpack.allowReachableSHA1InWant
-				// refuse an existing commit outside the shallow window with the same "not our ref".
 				if err := gitClient.Fetch(ctx, revision, depth); err != nil {
+					// If the remote permanently refuses to serve this SHA (gone from remote or outside the
+					// shallow window on a server without allowReachableSHA1InWant), classify it as not found
+					// so UpdateRevisionForPaths can fall through to a full sync that replaces the base instead
+					// of blocking auto-sync indefinitely. Transient errors stay codes.Internal for retry.
+					if isRevisionNotFoundError(err) {
+						return fmt.Errorf("failed to fetch revision %s: %w: %w", revision, git.ErrRevisionNotFound, err)
+					}
 					return status.Errorf(codes.Internal, "Failed to fetch revision %s: %v", revision, err)
 				}
 			}
@@ -3157,7 +3172,7 @@ func fetch(ctx context.Context, gitClient git.Client, targetRevisions []string, 
 			if err := gitClient.Fetch(ctx, revision, 0); err != nil {
 				// After a full fetch, only git's missing-object answers mean the remote no longer has the
 				// revision. These are git's English messages; a localized miss is handled as transient.
-				if msg := err.Error(); strings.Contains(msg, "not our ref") || strings.Contains(msg, "unadvertised object") || strings.Contains(msg, "couldn't find remote ref") {
+				if isRevisionNotFoundError(err) {
 					return fmt.Errorf("failed to fetch revision %s: %w: %w", revision, git.ErrRevisionNotFound, err)
 				}
 				return fmt.Errorf("failed to fetch revision %s: %w", revision, err)
@@ -3718,9 +3733,9 @@ func (s *Service) UpdateRevisionForPaths(ctx context.Context, request *apiclient
 			_, resolved, err = s.newHelmClientResolveRevision(ctx, repo, request.Revision, request.ApplicationSource.Chart, request.NoRevisionCache)
 		}
 		if err != nil {
-			// A transient registry error must not look like a version move; fall back to the last compared version.
-			logCtx.Warnf("error resolving revision %s, comparing last compared version instead: %v", request.Revision, err)
-			resolved = request.SyncedRevision
+			// Return the resolution error so reconciliation retries the requested selector instead of
+			// substituting the previously compared version (which may violate a new constraint).
+			return nil, status.Errorf(codes.Internal, "unable to resolve revision %s: %v", request.Revision, err)
 		}
 		resolvedNonGitRevision = resolved
 		if resolved != "" {
@@ -3771,6 +3786,11 @@ func (s *Service) UpdateRevisionForPaths(ctx context.Context, request *apiclient
 
 	tryTransferCache := func(transferEval *baseRevisionEvaluation) {
 		// Best-effort: a failure costs one regeneration and never influences Changes.
+		// Never copy cached manifests across a non-git (Helm/OCI) version/digest change: non-git
+		// contents are not diffed, so transferEval.changes only reflects ref-source diffs.
+		if !isGitSource && transferEval != nil && transferEval.resolvedRevision != transferEval.resolvedBase {
+			return
+		}
 		if transferEval != nil && !transferEval.changes && transferEval.revisionsAreDifferent {
 			if err := s.updateCachedRevision(logCtx, transferEval.resolvedBase, transferEval.resolvedRevision, request, transferEval.oldRepoRefs, transferEval.newRepoRefs); errors.Is(err, cache.ErrCacheMiss) {
 				logCtx.Info("manifest cache miss while moving manifests cache to the new revision")

@@ -562,7 +562,8 @@ func (c *Cache) GetGitDirectories(repoURL, revision string) ([]string, error) {
 }
 
 func getGitFilesChangesKey(repoURL, revision, targetRevision string) string {
-	return fmt.Sprintf("gitFilesChanges|%s|%s|%s", repoURL, revision, targetRevision)
+	// v2: git diff uses --no-renames so both sides of a rename are recorded.
+	return fmt.Sprintf("gitFilesChanges|v2|%s|%s|%s", repoURL, revision, targetRevision)
 }
 
 func (c *Cache) SetGitFilesChanges(repoURL, revision, targetRevision string, files []string) error {
