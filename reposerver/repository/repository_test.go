@@ -5981,7 +5981,7 @@ func TestUpdateRevisionForPaths_LastSyncedBase(t *testing.T) {
 		assert.True(t, manifestCacheContains(cacheMocks, request, revResolved), "cache transfer still runs on the compared base")
 	})
 
-	t.Run("transient fetch error of the last-synced base: not treated as gone", func(t *testing.T) {
+	t.Run("transient fetch error of the last-synced base: fails RPC so controller retries while still transferring cache", func(t *testing.T) {
 		s, _, cacheMocks := newServiceWithOpt(t, func(gitClient *gitmocks.Client, _ *helmmocks.Client, _ *ocimocks.Client, paths *iomocks.TempPaths) {
 			gitClient.EXPECT().Init().Return(nil)
 			gitClient.EXPECT().Fetch(mock.Anything, "", int64(0)).Return(nil)
@@ -6002,21 +6002,24 @@ func TestUpdateRevisionForPaths_LastSyncedBase(t *testing.T) {
 		seedManifestCache(t, cacheMocks, request, revCompared)
 
 		resp, err := s.UpdateRevisionForPaths(t.Context(), request)
-		require.NoError(t, err)
-		assert.False(t, resp.Changes, "a transient fetch error must not report changes (#29430)")
+		require.Error(t, err)
+		assert.Nil(t, resp)
+		assert.Equal(t, codes.Internal, status.Code(err))
+		assert.True(t, manifestCacheContains(cacheMocks, request, revResolved), "cache transfer still runs on the compared base")
 	})
 
-	t.Run("transient last-synced evaluation error: answers from the compared base", func(t *testing.T) {
-		// Reporting changes on e.g. a network error would auto-sync unrelated apps in a mono-repo (#29430),
-		// and failing the RPC would fail the whole comparison.
+	t.Run("transient last-synced evaluation error: fails RPC so controller retries while still transferring cache", func(t *testing.T) {
+		// Never substitute cacheEval's clean verdict for the sync decision: a failed diff against the
+		// last-synced base must return an explicit error so the controller retries rather than skipping hooks.
 		s, cacheMocks := newServiceWithFailingDiff(t, revLastSynced, nil)
 		request := newRequest(revCompared)
 		seedManifestCache(t, cacheMocks, request, revCompared)
 
 		resp, err := s.UpdateRevisionForPaths(t.Context(), request)
-		require.NoError(t, err)
-		assert.False(t, resp.Changes)
-		assert.Equal(t, revResolved, resp.Revision)
+		require.Error(t, err)
+		assert.Nil(t, resp)
+		assert.Equal(t, codes.Internal, status.Code(err))
+		assert.True(t, manifestCacheContains(cacheMocks, request, revResolved), "cache transfer still runs on the compared base")
 	})
 
 	t.Run("compared-base evaluation error: RPC still answers from the last-synced base", func(t *testing.T) {
@@ -6032,9 +6035,9 @@ func TestUpdateRevisionForPaths_LastSyncedBase(t *testing.T) {
 		assert.Equal(t, revResolved, resp.Revision)
 		assert.False(t, manifestCacheContains(cacheMocks, request, revResolved), "cache transfer is skipped when the compared base cannot be evaluated")
 	})
-	t.Run("shallow fetch of last-synced base refused: answers from the compared base", func(t *testing.T) {
-		// Without uploadpack.allowReachableSHA1InWant, a commit outside the shallow window that still
-		// exists is refused with "not our ref"; reporting it as gone would full-sync on every reconcile.
+	t.Run("shallow fetch of last-synced base refused: fails RPC instead of falling back to clean compared base", func(t *testing.T) {
+		// If a shallow clone can no longer fetch the last-synced commit A, falling back to cacheEval (B..B clean)
+		// would cause selfHeal=true to selectively sync B and skip hooks (or selfHeal=false to stay OutOfSync forever).
 		s, _, cacheMocks := newServiceWithOpt(t, func(gitClient *gitmocks.Client, _ *helmmocks.Client, _ *ocimocks.Client, paths *iomocks.TempPaths) {
 			gitClient.EXPECT().Init().Return(nil)
 			gitClient.EXPECT().Fetch(mock.Anything, revLastSynced, int64(1)).Return(errors.New("fatal: remote error: upload-pack: not our ref " + revLastSynced))
@@ -6055,9 +6058,10 @@ func TestUpdateRevisionForPaths_LastSyncedBase(t *testing.T) {
 		seedManifestCache(t, cacheMocks, request, revCompared)
 
 		resp, err := s.UpdateRevisionForPaths(t.Context(), request)
-		require.NoError(t, err)
-		assert.False(t, resp.Changes)
-		assert.Equal(t, revResolved, resp.Revision)
+		require.Error(t, err)
+		assert.Nil(t, resp)
+		assert.Equal(t, codes.Internal, status.Code(err))
+		assert.True(t, manifestCacheContains(cacheMocks, request, revResolved), "cache transfer still runs on the compared base")
 	})
 
 	t.Run("uncomparable base with no other base: changes reported, not an error", func(t *testing.T) {
@@ -6089,71 +6093,56 @@ func TestUpdateRevisionForPaths_LastSyncedBase(t *testing.T) {
 	})
 }
 
-func TestUpdateRevisionForPaths_ComposesLastSyncedDiffFromCachedDiffs(t *testing.T) {
-	// When the last-synced base lags, its diff is composed from the cached (lastSynced..compared) and
-	// (compared..resolved) sets instead of running git, so the per-application base does not multiply
-	// work over the repo-shared compared-base diff. A ChangedFiles call against the last-synced base
-	// would panic the mock — no expectation is registered for it.
+func TestUpdateRevisionForPaths_DirectDiffFromLastSyncedBaseCatchesRenameAndDelete(t *testing.T) {
+	// Regression: composing cached (A..B) and (B..C) file lists can hide a deletion when B renamed
+	// app/deploy.yaml -> sibling/deploy.yaml and C deleted sibling/deploy.yaml. Evaluating the
+	// direct diff A..C avoids losing paths across intermediate cached entries.
 	revLastSynced := "aaaa04d03def3a6a1125d934cb511680f7255511"
 	revCompared := "bbbb39659e542ed7de0c170a4fcc1c571b288fc0"
 	revResolved := "cccc504d03def3a6a1125d934cb511680f725552"
 
-	newComposedService := func(t *testing.T) (*Service, *repoCacheMocks) {
-		t.Helper()
-		s, _, cacheMocks := newServiceWithOpt(t, func(gitClient *gitmocks.Client, _ *helmmocks.Client, _ *ocimocks.Client, paths *iomocks.TempPaths) {
-			gitClient.EXPECT().Init().Return(nil)
-			gitClient.EXPECT().Fetch(mock.Anything, mock.Anything, mock.Anything).Return(nil)
-			gitClient.EXPECT().IsRevisionPresent(mock.Anything, mock.Anything).Return(false)
-			gitClient.EXPECT().Checkout(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return("", nil)
-			gitClient.EXPECT().LsRemote("HEAD").Return(revResolved, nil)
-			gitClient.EXPECT().LsRemote(revResolved).Return(revResolved, nil).Maybe()
-			gitClient.EXPECT().LsRemote(revLastSynced).Return(revLastSynced, nil)
-			gitClient.EXPECT().LsRemote(revCompared).Return(revCompared, nil)
-			gitClient.EXPECT().Root().Return("")
-			// Only the shared compared-base diff may hit git.
-			gitClient.EXPECT().ChangedFiles(mock.Anything, revCompared, revResolved).Return([]string{}, nil)
-			paths.EXPECT().GetPath(mock.Anything).Return(".", nil)
-			paths.EXPECT().GetPathIfExists(mock.Anything).Return(".")
-		}, ".")
-		return s, cacheMocks
+	s, _, cacheMocks := newServiceWithOpt(t, func(gitClient *gitmocks.Client, _ *helmmocks.Client, _ *ocimocks.Client, paths *iomocks.TempPaths) {
+		gitClient.EXPECT().Init().Return(nil)
+		gitClient.EXPECT().Fetch(mock.Anything, mock.Anything, mock.Anything).Return(nil)
+		gitClient.EXPECT().IsRevisionPresent(mock.Anything, mock.Anything).Return(false)
+		gitClient.EXPECT().Checkout(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return("", nil)
+		gitClient.EXPECT().LsRemote("HEAD").Return(revResolved, nil)
+		gitClient.EXPECT().LsRemote(revResolved).Return(revResolved, nil).Maybe()
+		gitClient.EXPECT().LsRemote(revLastSynced).Return(revLastSynced, nil)
+		gitClient.EXPECT().LsRemote(revCompared).Return(revCompared, nil)
+		gitClient.EXPECT().Root().Return("")
+		// Direct diff A..C reports app/deploy.yaml deleted, even though both intermediate cached sets
+		// only listed sibling/deploy.yaml.
+		gitClient.EXPECT().ChangedFiles(mock.Anything, revLastSynced, revResolved).Return([]string{"app/deploy.yaml"}, nil).Once()
+		paths.EXPECT().GetPath(mock.Anything).Return(".", nil)
+		paths.EXPECT().GetPathIfExists(mock.Anything).Return(".")
+	}, ".")
+
+	// Seed both intermediate diffs with rename-only output that omits app/deploy.yaml.
+	require.NoError(t, cacheMocks.cache.SetGitFilesChanges("a-url.com", revCompared, revLastSynced, []string{"sibling/deploy.yaml"}))
+	require.NoError(t, cacheMocks.cache.SetGitFilesChanges("a-url.com", revResolved, revCompared, []string{"sibling/deploy.yaml"}))
+
+	request := &apiclient.UpdateRevisionForPathsRequest{
+		Repo:               &v1alpha1.Repository{Repo: "a-url.com", Type: "git"},
+		Revision:           "HEAD",
+		SyncedRevision:     revCompared,
+		LastSyncedRevision: revLastSynced,
+		Paths:              []string{"app"},
+		AppLabelKey:        "app.kubernetes.io/name",
+		AppName:            "direct-diff",
+		Namespace:          "default",
+		TrackingMethod:     "annotation+label",
+		ApplicationSource:  &v1alpha1.ApplicationSource{Path: "app"},
 	}
 
-	newRequest := func() *apiclient.UpdateRevisionForPathsRequest {
-		return &apiclient.UpdateRevisionForPathsRequest{
-			Repo:               &v1alpha1.Repository{Repo: "a-url.com", Type: "git"},
-			Revision:           "HEAD",
-			SyncedRevision:     revCompared,
-			LastSyncedRevision: revLastSynced,
-			Paths:              []string{"."},
-			AppLabelKey:        "app.kubernetes.io/name",
-			AppName:            "composed-diff",
-			Namespace:          "default",
-			TrackingMethod:     "annotation+label",
-			ApplicationSource:  &v1alpha1.ApplicationSource{Path: "."},
-		}
-	}
+	resp, err := s.UpdateRevisionForPaths(t.Context(), request)
+	require.NoError(t, err)
+	assert.True(t, resp.Changes, "direct diff A..C must detect deletion of app/deploy.yaml")
+	assert.Equal(t, revResolved, resp.Revision)
 
-	t.Run("clean cached sets compose to no changes", func(t *testing.T) {
-		s, cacheMocks := newComposedService(t)
-		require.NoError(t, cacheMocks.cache.SetGitFilesChanges("a-url.com", revCompared, revLastSynced, []string{}))
-
-		resp, err := s.UpdateRevisionForPaths(t.Context(), newRequest())
-		require.NoError(t, err)
-		assert.False(t, resp.Changes)
-		assert.Equal(t, revResolved, resp.Revision)
-
-		_, err = cacheMocks.cache.GetGitFilesChanges("a-url.com", revResolved, revLastSynced)
-		require.ErrorIs(t, err, cache.ErrCacheMiss, "a composed set must not stand in for the shared real diff")
-	})
-
-	t.Run("relevant file in the cached tail set composes to changes", func(t *testing.T) {
-		s, cacheMocks := newComposedService(t)
-		require.NoError(t, cacheMocks.cache.SetGitFilesChanges("a-url.com", revCompared, revLastSynced, []string{"app.yaml"}))
-
-		resp, err := s.UpdateRevisionForPaths(t.Context(), newRequest())
-		require.NoError(t, err)
-		assert.True(t, resp.Changes, "a change recorded since the last sync must survive composition")
-	})
+	cachedDirect, err := cacheMocks.cache.GetGitFilesChanges("a-url.com", revResolved, revLastSynced)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"app/deploy.yaml"}, cachedDirect)
 }
 
 func TestUpdateRevisionForPaths_NonGitSourceUsesLastSyncedVersion(t *testing.T) {
@@ -6180,11 +6169,12 @@ func TestUpdateRevisionForPaths_NonGitSourceUsesLastSyncedVersion(t *testing.T) 
 		assert.Equal(t, "1.3.0", resp.Revision)
 	})
 
-	t.Run("unchanged version reports no changes", func(t *testing.T) {
+	t.Run("unchanged version reports no changes and returns concrete revision", func(t *testing.T) {
 		s, _, _ := newServiceWithOpt(t, func(_ *gitmocks.Client, _ *helmmocks.Client, _ *ocimocks.Client, _ *iomocks.TempPaths) {}, ".")
 		resp, err := s.UpdateRevisionForPaths(t.Context(), newRequest("1.2.3", "1.2.3"))
 		require.NoError(t, err)
 		assert.False(t, resp.Changes)
+		assert.Equal(t, "1.2.3", resp.Revision)
 	})
 
 	t.Run("legacy caller without last-synced base keeps legacy no-changes result", func(t *testing.T) {
@@ -6212,26 +6202,28 @@ func TestUpdateRevisionForPaths_NonGitSourceUsesLastSyncedVersion(t *testing.T) 
 		resp, err := s.UpdateRevisionForPaths(t.Context(), request)
 		require.NoError(t, err)
 		assert.True(t, resp.Changes, "a chart version move must not be masked by unchanged ref sources")
+		assert.Equal(t, "1.3.0", resp.Revision)
 	})
 
-	t.Run("version constraint is resolved before comparing", func(t *testing.T) {
-		// Revision carries the unresolved targetRevision. SyncedRevision lags a newly published version
-		// by one comparison, so only resolving Revision reports the move on the first refresh.
+	t.Run("version constraint is resolved before comparing and returned on both changed and unchanged results", func(t *testing.T) {
+		// Revision carries the unresolved targetRevision. Returning the concrete resolved version on
+		// both changed and unchanged verdicts ensures GenerateManifest renders the exact release checked.
 		sha := "1e67a504d03def3a6a1125d934cb511680f72555"
 		refs := v1alpha1.RefTargetRevisionMapping{
 			"$values": {Repo: v1alpha1.Repository{Repo: "a-url.com"}, TargetRevision: sha},
 		}
 		for _, tc := range []struct {
-			name     string
-			latest   string
-			withRefs bool
-			changes  bool
+			name         string
+			latest       string
+			withRefs     bool
+			changes      bool
+			wantRevision string
 		}{
-			{"unchanged without refs", "1.2.3", false, false},
-			{"unchanged with unchanged refs", "1.2.3", true, false},
-			{"new release without refs", "1.3.0", false, true},
-			{"new release with unchanged refs", "1.3.0", true, true},
-			{"resolve error falls back to compared version", "", false, false},
+			{"unchanged without refs", "1.2.3", false, false, "1.2.3"},
+			{"unchanged with unchanged refs", "1.2.3", true, false, "1.2.3"},
+			{"new release without refs", "1.3.0", false, true, "1.3.0"},
+			{"new release with unchanged refs", "1.3.0", true, true, "1.3.0"},
+			{"resolve error falls back to compared version", "", false, false, "1.2.3"},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				s, _, _ := newServiceWithOpt(t, func(_ *gitmocks.Client, helmClient *helmmocks.Client, _ *ocimocks.Client, _ *iomocks.TempPaths) {
@@ -6253,6 +6245,42 @@ func TestUpdateRevisionForPaths_NonGitSourceUsesLastSyncedVersion(t *testing.T) 
 				resp, err := s.UpdateRevisionForPaths(t.Context(), request)
 				require.NoError(t, err)
 				assert.Equal(t, tc.changes, resp.Changes)
+				assert.Equal(t, tc.wantRevision, resp.Revision, "must return the concrete resolved version so GenerateManifest does not re-resolve a moving selector")
+			})
+		}
+	})
+
+	t.Run("OCI tag is resolved and returned as concrete digest on both changed and unchanged results", func(t *testing.T) {
+		digestOld := "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+		digestNew := "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+		for _, tc := range []struct {
+			name         string
+			resolved     string
+			changes      bool
+			wantRevision string
+		}{
+			{"unchanged OCI tag returns concrete digest", digestOld, false, digestOld},
+			{"moved OCI tag returns new concrete digest", digestNew, true, digestNew},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				s, _, _ := newServiceWithOpt(t, func(_ *gitmocks.Client, _ *helmmocks.Client, ociClient *ocimocks.Client, _ *iomocks.TempPaths) {
+					ociClient.EXPECT().ResolveRevision(mock.Anything, "latest", true).Return(tc.resolved, nil)
+				}, ".")
+				request := &apiclient.UpdateRevisionForPathsRequest{
+					Repo:               &v1alpha1.Repository{Repo: "oci://registry.example.com/app", Type: "oci"},
+					Revision:           "latest",
+					SyncedRevision:     digestOld,
+					LastSyncedRevision: digestOld,
+					NoRevisionCache:    true,
+					Paths:              []string{"."},
+					AppName:            "oci-app",
+					Namespace:          "default",
+					ApplicationSource:  &v1alpha1.ApplicationSource{RepoURL: "oci://registry.example.com/app", TargetRevision: "latest"},
+				}
+				resp, err := s.UpdateRevisionForPaths(t.Context(), request)
+				require.NoError(t, err)
+				assert.Equal(t, tc.changes, resp.Changes)
+				assert.Equal(t, tc.wantRevision, resp.Revision)
 			})
 		}
 	})

@@ -3327,4 +3327,27 @@ func TestCompareAppStateRepoErrorPreservesRevision(t *testing.T) {
 		assert.Equal(t, v1alpha1.SyncStatusCodeUnknown, compRes.syncStatus.Status)
 		assert.Equal(t, []string{revA, revB}, compRes.syncStatus.Revisions)
 	})
+
+	t.Run("spec targetRevision changed from pinned A to B and compare fails: keeps ComparedTo.Source paired with Revision A", func(t *testing.T) {
+		app := newFakeApp()
+		prevSource := app.Spec.GetSource()
+		prevSource.TargetRevision = revA
+		app.Status.Sync = v1alpha1.SyncStatus{
+			Status:   v1alpha1.SyncStatusCodeSynced,
+			Revision: revA,
+			ComparedTo: v1alpha1.ComparedTo{
+				Source:      prevSource,
+				Destination: app.Spec.Destination,
+			},
+		}
+		app.Spec.Source.TargetRevision = revB
+
+		ctrl := newFakeController(t.Context(), &fakeData{manifestResponses: make([]*apiclient.ManifestResponse, 1)}, errors.New("repo timeout"))
+		compRes, err := ctrl.appStateManager.CompareAppState(t.Context(), app, &defaultProj, []string{revB}, []v1alpha1.ApplicationSource{app.Spec.GetSource()}, false, true, nil, false)
+		require.NoError(t, err)
+		require.NotNil(t, compRes)
+		assert.Equal(t, v1alpha1.SyncStatusCodeUnknown, compRes.syncStatus.Status)
+		assert.Equal(t, revA, compRes.syncStatus.Revision)
+		assert.Equal(t, revA, compRes.syncStatus.ComparedTo.Source.TargetRevision, "ComparedTo.Source must remain paired with the preserved Revision so spec drift is still detected")
+	})
 }

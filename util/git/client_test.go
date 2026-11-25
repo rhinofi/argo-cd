@@ -581,6 +581,34 @@ func Test_ChangedFiles(t *testing.T) {
 	changedFiles, err = client.ChangedFiles(t.Context(), previousSHA, commitSHA)
 	require.NoError(t, err)
 	assert.ElementsMatch(t, []string{"README"}, changedFiles)
+
+	// Rename out of app/ then delete: --no-renames must report both sides of a rename so
+	// manifest-generate-paths scoped to app/ never misses a move/deletion.
+	require.NoError(t, os.MkdirAll(path.Join(client.Root(), "app"), 0o755))
+	require.NoError(t, os.MkdirAll(path.Join(client.Root(), "sibling"), 0o755))
+	require.NoError(t, os.WriteFile(path.Join(client.Root(), "app", "deploy.yaml"), []byte("kind: Deployment\nmetadata:\n  name: demo\n"), 0o644))
+	require.NoError(t, runCmd(ctx, client.Root(), "git", "add", "app/deploy.yaml"))
+	require.NoError(t, runCmd(ctx, client.Root(), "git", "commit", "-m", "Add app/deploy.yaml"))
+	shaA, err := client.LsRemote("HEAD")
+	require.NoError(t, err)
+
+	require.NoError(t, runCmd(ctx, client.Root(), "git", "mv", "app/deploy.yaml", "sibling/deploy.yaml"))
+	require.NoError(t, runCmd(ctx, client.Root(), "git", "commit", "-m", "Rename to sibling/deploy.yaml"))
+	shaB, err := client.LsRemote("HEAD")
+	require.NoError(t, err)
+
+	require.NoError(t, runCmd(ctx, client.Root(), "git", "rm", "sibling/deploy.yaml"))
+	require.NoError(t, runCmd(ctx, client.Root(), "git", "commit", "-m", "Delete sibling/deploy.yaml"))
+	shaC, err := client.LsRemote("HEAD")
+	require.NoError(t, err)
+
+	changedFiles, err = client.ChangedFiles(t.Context(), shaA, shaB)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"app/deploy.yaml", "sibling/deploy.yaml"}, changedFiles)
+
+	changedFiles, err = client.ChangedFiles(t.Context(), shaA, shaC)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"app/deploy.yaml"}, changedFiles)
 }
 
 func Test_SemverTags(t *testing.T) {

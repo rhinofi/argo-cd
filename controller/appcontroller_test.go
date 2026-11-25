@@ -1169,6 +1169,63 @@ func TestAutoSyncSyncedToUnknownToOutOfSyncTriggersFullSync(t *testing.T) {
 	}
 }
 
+func TestProcessAppRefresh_UnknownDoesNotUseStaleRevisionOnCompareWithRecent(t *testing.T) {
+	// Regression: if an app changes from pinned commit A to B and is in Unknown status with stale
+	// Status.Sync.Revision=A, a CompareWithRecent refresh must resolve Spec.Source.TargetRevision (B),
+	// never A.
+	revA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	revB := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+	app := newFakeApp()
+	app.Spec.Source.TargetRevision = revB
+	app.Spec.SyncPolicy.Automated.SelfHeal = new(true)
+	now := metav1.Now()
+	app.Status.ReconciledAt = &now
+	app.Status.Sync = v1alpha1.SyncStatus{
+		Status:   v1alpha1.SyncStatusCodeUnknown,
+		Revision: revA,
+		ComparedTo: v1alpha1.ComparedTo{
+			Source:            app.Spec.GetSource(), // even if ComparedTo already matched B
+			Destination:       app.Spec.Destination,
+			IgnoreDifferences: app.Spec.IgnoreDifferences,
+		},
+	}
+	app.Status.OperationState = &v1alpha1.OperationState{
+		Phase:      synccommon.OperationSucceeded,
+		FinishedAt: &metav1.Time{Time: time.Now().Add(-10 * time.Minute)},
+		SyncResult: &v1alpha1.SyncOperationResult{
+			Revision: revA,
+			Source:   app.Spec.GetSource(),
+		},
+	}
+
+	var requestedRevisions []string
+	ctrl := newFakeController(t.Context(), &fakeData{
+		apps: []runtime.Object{app.DeepCopy(), &defaultProj},
+		manifestResponse: &apiclient.ManifestResponse{
+			Manifests: []string{`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"cm-b","namespace":"fake-dest-ns"}}`},
+			Namespace: test.FakeDestNamespace,
+			Server:    test.FakeClusterURL,
+			Revision:  revB,
+		},
+		onGenerateManifest: func(req *apiclient.ManifestRequest) {
+			requestedRevisions = append(requestedRevisions, req.Revision)
+		},
+	}, nil)
+
+	ctrl.requestAppRefresh(app.QualifiedName(), CompareWithRecent.Pointer(), nil)
+	ctrl.processAppRefreshQueueItem()
+
+	require.Equal(t, []string{revB}, requestedRevisions, "CompareWithRecent while Unknown must use Spec.Source.TargetRevision (B), not stale Status.Sync.Revision (A)")
+
+	updatedApp, err := ctrl.applicationClientset.ArgoprojV1alpha1().Applications(test.FakeArgoCDNamespace).Get(t.Context(), app.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.NotNil(t, updatedApp.Operation)
+	require.NotNil(t, updatedApp.Operation.Sync)
+	assert.Equal(t, revB, updatedApp.Operation.Sync.Revision)
+	assert.Empty(t, updatedApp.Operation.Sync.Resources)
+}
+
 func TestAutoSyncManifestGeneratePathsNewCommit_SelfHeal(t *testing.T) {
 	// Regression for #22795 & #27875 with selfHeal=true:
 	// - When a new commit touched app paths since last sync, auto-sync must run a FULL sync (hooks run).
