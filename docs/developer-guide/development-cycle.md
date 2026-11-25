@@ -104,6 +104,24 @@ Below you can find a few examples of how to run specific tests.
 
 For more information about End-to-End tests, refer to the [End-to-End test documentation](test-e2e.md).
 
+## Run the checks in a Nix development shell
+
+On Linux, run the checkout checks from the repository root.
+
+```bash
+nix develop -c argocd-check
+```
+
+This builds the Go code, CLI, and binary with the embedded UI, runs Go and UI lint and unit tests, and checks generated files. Go lint leaves fixes to the developer. Code generation reports differences against a temporary copy of your working files, including uncommitted changes. The command lists failed checks and exits nonzero if any fail.
+
+For a faster iteration, select checks by name. In a shallow clone, pass the shallow Git URL when entering the shell.
+
+```bash
+nix develop "git+file://$PWD?shallow=1"
+argocd-check lint-ui test-ui
+argocd-check --help
+```
+
 ## Common Make Targets
 
 Here are some frequently used make targets (all will run on your machine):

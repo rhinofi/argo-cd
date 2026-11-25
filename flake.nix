@@ -108,6 +108,16 @@
             fi
             exec ${pkgs.proot}/bin/proot -b ${scriptBin}/bin:/bin ${pkgs.gnumake}/bin/make "$@"
           '';
+          localChecks = pkgs.writeShellScriptBin "argocd-check" ''
+            export PATH=${
+              pkgs.lib.makeBinPath [
+                (toolsFor "codegen-go")
+                (toolsFor "lint")
+              ]
+            }:"$PATH"
+            prepareCodegen=${prepareCodegen}
+            source ${./hack/check-local.sh}
+          '';
           tools = with pkgs; [
             bashInteractive
             coreutils
@@ -145,6 +155,7 @@
             protoc
             prepare
             nativeMake
+            localChecks
           ];
           version = pkgs.lib.removeSuffix "\n" (builtins.readFile ./VERSION);
           src = pkgs.lib.fileset.toSource {
@@ -296,7 +307,7 @@
 
           toolsFor =
             name:
-            goTask {
+            (goTask {
               name = "${name}-tools";
               proxy = toolModules;
               source = toolSource;
@@ -305,11 +316,26 @@
                 bash hack/installers/install-${name}-tools.sh
               '';
               installPhase = ''mkdir -p "$out" && mv dist "$out/bin"'';
-            };
+            }).overrideAttrs
+              {
+                # Installer binaries depend on the tool sources, independent of the checkout revision.
+                GIT_COMMIT = "";
+                GIT_TREE_STATE = "";
+              };
           redisChart = pkgs.fetchurl {
             url = "https://github.com/DandyDeveloper/charts/releases/download/redis-ha-4.35.10/redis-ha-4.35.10.tgz";
             sha256 = "d6fd5a047bfab24ac91148b48ade18c49947a2da5d0f9adc87c24e6027456573";
           };
+          # Both codegen checks run this in a disposable copy of the checkout.
+          prepareCodegen = pkgs.writeShellScript "prepare-codegen" ''
+            set -eu
+            mkdir -p dist
+            ln -s ${protoc}/include dist/protoc-include
+            cd manifests/ha/base/redis-ha
+            grep -Fx '  version: 4.35.10' chart/requirements.yaml
+            grep -Fx 'helm dependency update ./chart' generate.sh
+            sed -i 's|^helm dependency update ./chart$|mkdir -p chart/charts \&\& cp ${redisChart} chart/charts/redis-ha-4.35.10.tgz|' generate.sh
+          '';
           examples = pkgs.fetchgit {
             url = "https://github.com/argoproj/argocd-example-apps.git";
             rev = "8088f4c0d970abb09e250248cc97e35623447cb5";
@@ -408,12 +434,7 @@
               buildPhase = ''
                 patchShebangs hack manifests/ha/base/redis-ha/generate.sh
                 substituteInPlace hack/generate-proto.sh --replace-fail '/bin/rm' 'rm'
-                cd manifests/ha/base/redis-ha
-                grep -Fx '  version: 4.35.10' chart/requirements.yaml
-                substituteInPlace generate.sh --replace-fail 'helm dependency update ./chart' \
-                  'mkdir -p chart/charts && cp ${redisChart} chart/charts/redis-ha-4.35.10.tgz'
-                cd - >/dev/null
-                ln -s ${protoc}/include dist/protoc-include
+                ${prepareCodegen}
               ''
               + checkout
               + ''
