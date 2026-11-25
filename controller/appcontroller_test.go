@@ -1042,6 +1042,42 @@ func TestAutoSyncCompareWithRecentAfterBlockedSync(t *testing.T) {
 	}
 }
 
+func TestCompareWithRecentAfterFailedSourceChange(t *testing.T) {
+	const previous = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const desired = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	app := newFakeApp()
+	app.Spec.Source.TargetRevision = previous
+	app.Status.Sync = v1alpha1.SyncStatus{
+		Status:     v1alpha1.SyncStatusCodeSynced,
+		Revision:   previous,
+		ComparedTo: v1alpha1.ComparedTo{Source: app.Spec.GetSource(), Destination: app.Spec.Destination},
+	}
+	app.Spec.Source.TargetRevision = desired
+
+	var failedRevision string
+	ctrl := newFakeController(t.Context(), &fakeData{
+		apps:               []runtime.Object{app, &defaultProj},
+		onGenerateManifest: func(req *apiclient.ManifestRequest) { failedRevision = req.Revision },
+	}, errors.New("git fetch timeout"))
+	ctrl.processAppRefreshQueueItem()
+	require.Equal(t, desired, failedRevision)
+	app, err := ctrl.applicationClientset.ArgoprojV1alpha1().Applications(app.Namespace).Get(t.Context(), app.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, v1alpha1.SyncStatusCodeUnknown, app.Status.Sync.Status)
+
+	// A managed resource event requests a recent comparison before the periodic refresh.
+	// Capture the actual revision sent to GenerateManifest on recovery.
+	var recoveryRevision string
+	ctrl = newFakeController(t.Context(), &fakeData{
+		apps:               []runtime.Object{app, &defaultProj},
+		manifestResponse:   &apiclient.ManifestResponse{Revision: desired},
+		onGenerateManifest: func(req *apiclient.ManifestRequest) { recoveryRevision = req.Revision },
+	}, nil)
+	ctrl.requestAppRefresh(app.QualifiedName(), CompareWithRecent.Pointer(), nil)
+	ctrl.processAppRefreshQueueItem()
+	require.Equal(t, desired, recoveryRevision, "the recovered comparison must render the currently pinned revision")
+}
+
 func TestAutoSyncSyncedToUnknownToOutOfSyncTriggersFullSync(t *testing.T) {
 	// Regression for Synced -> Unknown -> OutOfSync after a repo-server error (git fetch timeout / auth failure):
 	// recovery onto a new commit must trigger a full sync (empty op.Sync.Resources so Sync hooks run and
