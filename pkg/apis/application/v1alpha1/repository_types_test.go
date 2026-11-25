@@ -286,3 +286,41 @@ func TestRepository_Normalize(t *testing.T) {
 		})
 	}
 }
+
+func TestGetGitCredsTokenFactoryPrecedence(t *testing.T) {
+	t.Setenv("ARGOCD_GITHUB_TOKEN_FACTORY_URL", "https://github-argo-git-dev.run.app")
+	t.Setenv("ARGOCD_GITHUB_TOKEN_FACTORY_INVOKER_SA", "pam-protected-sa@rhino-gh-argo-git-dev-invoker.iam.gserviceaccount.com")
+	t.Setenv("ARGOCD_GITHUB_TOKEN_FACTORY_REPO_URL", "https://github.com/rhinofi/dvf-k8s-manifests-dev.git")
+
+	matchingRepo := &Repository{Repo: "https://github.com/rhinofi/dvf-k8s-manifests-dev.git"}
+	creds := matchingRepo.GetGitCreds(git.NoopCredsStore{})
+	_, ok := creds.(git.TokenFactoryCreds)
+	require.Truef(t, ok, "expected TokenFactoryCreds but got %T", creds)
+
+	// Token factory takes precedence over stale static credentials for the configured repo
+	// so a rollout cannot silently keep authenticating with an old PAT.
+	withStalePassword := &Repository{
+		Repo:     "https://github.com/rhinofi/dvf-k8s-manifests-dev.git",
+		Username: "dvf-ci",
+		Password: "static-password",
+	}
+	creds = withStalePassword.GetGitCreds(git.NoopCredsStore{})
+	_, ok = creds.(git.TokenFactoryCreds)
+	require.Truef(t, ok, "expected TokenFactoryCreds to take precedence over static password, got %T", creds)
+
+	// Non-matching repositories with static credentials keep using HTTPSCreds.
+	otherWithPassword := &Repository{
+		Repo:     "https://github.com/rhinofi/other-repo.git",
+		Username: "dvf-ci",
+		Password: "static-password",
+	}
+	creds = otherWithPassword.GetGitCreds(git.NoopCredsStore{})
+	_, ok = creds.(git.HTTPSCreds)
+	require.Truef(t, ok, "expected HTTPSCreds for non-matching repo, got %T", creds)
+
+	// Non-matching passwordless repository falls through to NopCreds.
+	otherRepo := &Repository{Repo: "https://github.com/rhinofi/other-repo.git"}
+	creds = otherRepo.GetGitCreds(git.NoopCredsStore{})
+	_, ok = creds.(git.NopCreds)
+	require.Truef(t, ok, "expected NopCreds for non-matching repo but got %T", creds)
+}

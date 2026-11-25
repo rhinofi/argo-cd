@@ -277,6 +277,9 @@ func (repo *Repository) GetGitCreds(store git.CredsStore) git.Creds {
 	if repo == nil {
 		return git.NopCreds{}
 	}
+	if creds, ok := git.NewTokenFactoryCredsForRepo(repo.Repo, store); ok {
+		return creds
+	}
 	if repo.Password != "" || repo.BearerToken != "" {
 		return git.NewHTTPSCreds(repo.Username, repo.Password, repo.BearerToken, repo.TLSClientCertData, repo.TLSClientCertKey, repo.IsInsecure(), store, repo.ForceHttpBasicAuth)
 	}
