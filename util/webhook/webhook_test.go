@@ -1160,10 +1160,7 @@ func TestHandleEvent(t *testing.T) {
 			w := httptest.NewRecorder()
 			h.Handler(w, req)
 
-			// Wait briefly for refresh processing
-			time.Sleep(50 * time.Millisecond)
-
-			// Shutdown properly
+			// Shutdown drains payload workers before draining the refresh queue
 			h.Shutdown()
 
 			assert.Equal(t, http.StatusOK, w.Code)

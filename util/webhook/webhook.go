@@ -90,7 +90,8 @@ type appRefreshRequest struct {
 }
 
 type ArgoCDWebhookHandler struct {
-	sync.WaitGroup                // for testing
+	sync.WaitGroup                               // tracks refresh workers
+	workerWG                      sync.WaitGroup // tracks payload workers draining queue
 	repoCache                     *cache.Cache
 	serverCache                   *servercache.Cache
 	db                            db.ArgoDB
@@ -191,7 +192,7 @@ func NewHandler(namespace string, applicationNamespaces []string, webhookParalle
 func (a *ArgoCDWebhookHandler) startWorkerPool(webhookParallelism int) {
 	compLog := log.WithField("component", "api-server-webhook")
 	for range webhookParallelism {
-		a.Go(func() {
+		a.workerWG.Go(func() {
 			for {
 				payload, ok := <-a.queue
 				if !ok {
@@ -1049,6 +1050,8 @@ func (a *ArgoCDWebhookHandler) processWebhook(r *http.Request) (any, bool, error
 // Shutdown gracefully shuts down the webhook handler by closing queues and waiting for workers
 func (a *ArgoCDWebhookHandler) Shutdown() {
 	close(a.queue)
+	// Wait for payload workers to finish enqueuing refresh requests before shutting down refreshQueue.
+	a.workerWG.Wait()
 	a.refreshQueue.ShutDownWithDrain()
 	a.Wait()
 }
