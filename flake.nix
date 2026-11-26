@@ -196,7 +196,7 @@
           # -n resolves the installer's actual packages, without compiling executables
           # into a fixed-output derivation. Both Linux targets share this module proxy.
           toolModules =
-            goProxy "argocd-check-tools" toolSource "sha256-CkbaWEoFmdvfLUeukhH3z+ExDEQN2vEmcyXBqWa5TlU="
+            goProxy "argocd-check-tools" toolSource "sha256-JiOxYMmnhTDIPcx6v0jgGiqwBiEgPBvbYtrRsXAvozo="
               ''
                 rmdir vendor
                 go() {
@@ -214,6 +214,25 @@
                   bash hack/installers/install-codegen-go-tools.sh
                   bash hack/installers/install-lint-tools.sh
                 done
+                # go install pkg@ver and go get query the latest upstream release for
+                # retractions, leaving floating un-zipped <latest>.{info,mod} files and
+                # corresponding @v/list entries in the proxy cache. Strip them and
+                # rebuild @v/list from the remaining pinned .mod files so this FOD stays
+                # reproducible across upstream releases.
+                shopt -s nullglob
+                while IFS= read -r -d "" info; do
+                  base="''${info%.info}"
+                  if [[ ! -f "$base.zip" ]]; then
+                    rm -f "$base.info" "$base.mod"
+                    dir="$(dirname "$info")"
+                    mods=("$dir"/*.mod)
+                    if (( ''${#mods[@]} > 0 )); then
+                      printf '%s\n' "''${mods[@]##*/}" | sed 's/\.mod$//' | LC_ALL=C sort -u > "$dir/list"
+                    else
+                      rm -f "$dir/list"
+                    fi
+                  fi
+                done < <(find "$GOPATH/pkg/mod/cache/download" -path '*/@v/*.info' -print0)
               '';
 
           pnpmDeps = pkgs.fetchPnpmDeps {
